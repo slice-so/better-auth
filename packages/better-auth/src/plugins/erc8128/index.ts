@@ -178,19 +178,67 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			before: [
 				{
 					matcher(context: { request?: Request; headers?: Headers }) {
-						const auth =
-							context.request?.headers.get("authorization") ||
-							context.headers?.get("authorization") ||
-							"";
-						return auth.toLowerCase().startsWith("erc-8128 ");
+						if (context.request) {
+							const resolvedRoutePolicy = resolveRoutePolicy(
+								options.routePolicy,
+								context.request,
+							);
+							if (
+								resolvedRoutePolicy.requireAuth &&
+								!resolvedRoutePolicy.skipVerification
+							) {
+								return true;
+							}
+						}
+
+						const headers = context.request?.headers || context.headers;
+						if (!headers) {
+							return false;
+						}
+
+						const auth = headers.get("authorization") || "";
+						if (auth.toLowerCase().startsWith("erc-8128 ")) {
+							return true;
+						}
+
+						return !!(headers.get("signature") && headers.get("signature-input"));
 					},
 					handler: createAuthMiddleware(async (ctx) => {
-						const authHeader =
-							ctx.request?.headers.get("authorization") ||
-							ctx.headers?.get("authorization") ||
-							"";
-						if (!authHeader.toLowerCase().startsWith("erc-8128 ")) {
+						const incomingHeaders = (ctx.request?.headers || ctx.headers) as Headers | undefined;
+						if (!incomingHeaders) {
 							return;
+						}
+
+						const resolvedRoutePolicy = ctx.request
+							? resolveRoutePolicy(options.routePolicy, ctx.request)
+							: ({ requireAuth: false, skipVerification: false } as const);
+						if (resolvedRoutePolicy.skipVerification) {
+							return;
+						}
+
+						const authHeader = incomingHeaders.get("authorization") || "";
+						const hasSignatureHeaders =
+							!!incomingHeaders.get("signature") && !!incomingHeaders.get("signature-input");
+
+						if (!authHeader.toLowerCase().startsWith("erc-8128 ") && !hasSignatureHeaders) {
+							if (!resolvedRoutePolicy.requireAuth) {
+								return;
+							}
+							return new Response(
+								JSON.stringify({
+									error: "erc8128_verification_failed",
+									reason: "missing_signature",
+									detail: "Signature and Signature-Input headers are required",
+								}),
+								{
+									status: 401,
+									headers: {
+										"Content-Type": "application/json",
+										"WWW-Authenticate":
+											'Signature realm="erc8128", headers="@method @target-uri @authority"',
+									},
+								},
+							);
 						}
 
 						const nonceStore =
@@ -204,7 +252,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								...options.defaultPolicy,
 								maxValiditySec: options.maxValiditySec ?? 300,
 								clockSkewSec: options.clockSkewSec ?? 30,
-								replayable:
+							maxSignatureVerifications: 1,
+							replayable:
 									options.defaultPolicy?.replayable ??
 									options.allowReplayable ??
 									false,
@@ -230,14 +279,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							ctx.request?.headers.get("signature") ||
 							ctx.headers?.get("signature") ||
 							null;
-
-						const resolvedRoutePolicy = resolveRoutePolicy(
-							options.routePolicy,
-							ctx.request!,
-						);
-						if (resolvedRoutePolicy.skipVerification) {
-							return;
-						}
 
 						const responseHeaders: Record<string, string> = {};
 
@@ -282,8 +323,30 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							}
 						}
 
+						if (!ctx.request) {
+							if (!resolvedRoutePolicy.requireAuth) {
+								return;
+							}
+							return new Response(
+								JSON.stringify({
+									error: "erc8128_verification_failed",
+									reason: "missing_request_context",
+									detail:
+										"Unable to verify signature without request context",
+								}),
+								{
+									status: 401,
+									headers: {
+										"Content-Type": "application/json",
+										"WWW-Authenticate":
+											'Signature realm="erc8128", headers="@method @target-uri @authority"',
+									},
+								},
+							);
+						}
+
 						result ??= await verifier.verifyRequest({
-							request: ctx.request!,
+							request: ctx.request,
 							policy: resolvedRoutePolicy.policy,
 							setHeaders: (name, value) => {
 								responseHeaders[name] = value;
@@ -427,13 +490,27 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						defaults: {
 							maxValiditySec: options.maxValiditySec ?? 300,
 							clockSkewSec: options.clockSkewSec ?? 30,
+							maxSignatureVerifications: 1,
 							replayable: false,
 						},
 					});
 
 					const responseHeaders: Record<string, string> = {};
+
+					const sourceRequest = ctx.request!;
+					const hasBodyMethod =
+						sourceRequest.method !== "GET" && sourceRequest.method !== "HEAD";
+					const verificationRequest =
+						hasBodyMethod && ctx.body !== undefined
+							? new Request(sourceRequest.url, {
+								method: sourceRequest.method,
+								headers: sourceRequest.headers,
+								body: JSON.stringify(ctx.body),
+							})
+							: sourceRequest;
+
 					const result = await verifier.verifyRequest({
-						request: ctx.request!,
+						request: verificationRequest,
 						setHeaders: (name, value) => {
 							responseHeaders[name] = value;
 						},
@@ -644,8 +721,21 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								});
 
 								const responseHeaders: Record<string, string> = {};
+
+								const sourceRequest = ctx.request!;
+								const hasBodyMethod =
+									sourceRequest.method !== "GET" && sourceRequest.method !== "HEAD";
+								const verificationRequest =
+									hasBodyMethod && ctx.body !== undefined
+										? new Request(sourceRequest.url, {
+											method: sourceRequest.method,
+											headers: sourceRequest.headers,
+											body: JSON.stringify(ctx.body),
+										})
+										: sourceRequest;
+
 								const result = await verifier.verifyRequest({
-									request: ctx.request!,
+									request: verificationRequest,
 									setHeaders: (name, value) => {
 										responseHeaders[name] = value;
 									},
