@@ -46,12 +46,6 @@ export interface ERC8128PluginOptions {
 	schema?: InferOptionSchema<typeof schema> | undefined;
 }
 
-const verifyBodySchema = z
-	.object({
-		email: z.email().optional(),
-	})
-	.optional();
-
 const invalidateBodySchema = z
 	.object({
 		notBefore: z.number().int().positive().optional(),
@@ -70,6 +64,17 @@ const MAX_CACHE_SIZE = 10_000;
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
 	const verificationCache = new Map<string, CacheValue>();
+
+	const verifyBodySchema = z
+		.object({
+			email: z.email().optional(),
+		})
+		.optional()
+		.refine((data) => options.anonymous !== false || !!data?.email, {
+			message:
+				"Email is required when the anonymous plugin option is disabled.",
+			path: ["email"],
+		});
 
 	return {
 		id: "erc8128",
@@ -249,32 +254,15 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					const nonceStore =
 						options.nonceStore ??
 						createAdapterNonceStore(ctx.context.internalAdapter);
+					// Verify endpoint requires request-bound, non-replayable signatures
+					// (replayable/class-bound flexibility is for the middleware only)
 					const verifier = createVerifierClient({
 						verifyMessage: options.verifyMessage,
 						nonceStore,
 						defaults: {
-							...options.defaultPolicy,
 							maxValiditySec: options.maxValiditySec ?? 300,
 							clockSkewSec: options.clockSkewSec ?? 30,
-							replayable:
-								options.defaultPolicy?.replayable ??
-								options.allowReplayable ??
-								false,
-							...(options.allowReplayable
-								? {
-										replayableNotBefore: async (keyid: string) => {
-											const record = await ctx.context.adapter.findOne<{
-												notBefore: number;
-											}>({
-												model: "erc8128Invalidation",
-												where: [
-													{ field: "keyId", operator: "eq", value: keyid },
-												],
-											});
-											return record?.notBefore ?? null;
-										},
-									}
-								: {}),
+							replayable: false,
 						},
 					});
 
