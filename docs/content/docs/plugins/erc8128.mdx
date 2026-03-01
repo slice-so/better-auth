@@ -3,7 +3,7 @@ title: ERC-8128
 description: Authenticate Ethereum requests with HTTP Message Signatures (ERC-8128)
 ---
 
-The ERC-8128 plugin lets users authenticate requests using [ERC-8128](https://erc8128.slice.so), an Ethereum-native HTTP Message Signatures flow based on the ERC spec. Instead of SIWE’s challenge-response login exchange, ERC-8128 signs each request cryptographically, enabling both session-based sign-in and stateless per-request authentication.
+The ERC-8128 plugin lets users authenticate requests using [ERC-8128](https://erc8128.org), an Ethereum-native signature-based authentication flow based on HTTP Message Signatures and the ERC-8128 specification. ERC-8128 signs each request cryptographically, enabling both session-based sign-in and stateless per-request authentication.
 
 ## Installation
 
@@ -179,7 +179,7 @@ export const auth = betterAuth({
 
 ### Replayable signatures
 
-Replayable signatures are useful for short-lived automation and backend-to-backend calls where re-signing every request is expensive.
+Replayable signatures are useful for short-lived automation and backend-to-backend calls where signing and verifying the same request multiple times is not desirable.
 
 ```ts title="auth.ts"
 import { betterAuth } from "better-auth";
@@ -407,16 +407,6 @@ What it **does not** do:
 
 - It does not create users or wallet links in middleware-only requests.
 - It does not block non-ERC-8128 requests; unmatched requests fall through normally.
-
-## Migration from SIWE
-
-You can migrate incrementally without downtime:
-
-1. Keep SIWE enabled and add ERC-8128 alongside it.
-2. Reuse the shared `walletAddress` table for wallet identity mapping.
-3. Move clients/routes gradually from SIWE nonce+verify flow to signed HTTP requests.
-4. Keep both plugins active until all clients are migrated.
-5. Remove SIWE once no clients depend on it.
 
 ## Smart Contract Accounts
 
