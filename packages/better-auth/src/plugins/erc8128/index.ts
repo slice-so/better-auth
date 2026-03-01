@@ -332,7 +332,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 								if (
 									!notBeforeRecord ||
-									cached.created >= notBeforeRecord.notBefore
+									cached.created > notBeforeRecord.notBefore
 								) {
 									result = {
 										ok: true,
@@ -399,6 +399,81 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									},
 								},
 							);
+						}
+
+						if (result.replayable && options.allowReplayable) {
+							const notBeforeRecord = await ctx.context.adapter.findOne<{
+								notBefore: number;
+							}>({
+								model: "erc8128Invalidation",
+								where: [
+									{
+										field: "keyId",
+										operator: "eq",
+										value: result.params.keyid,
+									},
+								],
+							});
+							if (
+								notBeforeRecord &&
+								result.params.created < notBeforeRecord.notBefore
+							) {
+								if (!resolvedRoutePolicy.requireAuth) {
+									return;
+								}
+								return new Response(
+									JSON.stringify({
+										error: "erc8128_verification_failed",
+										reason: "replayable_invalidated",
+										detail: "Replayable signature was invalidated",
+									}),
+									{
+										status: 401,
+										headers: {
+											"Content-Type": "application/json",
+											...responseHeaders,
+										},
+									},
+								);
+							}
+						}
+
+						// Check notBefore for replayable sigs (invalidation support)
+						if (result.replayable && options.allowReplayable) {
+							const nbRecord = await ctx.context.adapter.findOne<{
+								notBefore: number;
+							}>({
+								model: "erc8128Invalidation",
+								where: [
+									{
+										field: "keyId",
+										operator: "eq",
+										value: result.params.keyid,
+									},
+								],
+							});
+							if (
+								nbRecord &&
+								result.params.created < nbRecord.notBefore
+							) {
+								if (!resolvedRoutePolicy.requireAuth) {
+									return;
+								}
+								return new Response(
+									JSON.stringify({
+										error: "erc8128_verification_failed",
+										reason: "replayable_invalidated",
+										detail: "Replayable signature was invalidated",
+									}),
+									{
+										status: 401,
+										headers: {
+											"Content-Type": "application/json",
+											...responseHeaders,
+										},
+									},
+								);
+							}
 						}
 
 						// Cache replayable verification result (LRU eviction)
@@ -754,14 +829,19 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								const sourceRequest = ctx.request!;
 								const hasBodyMethod =
 									sourceRequest.method !== "GET" && sourceRequest.method !== "HEAD";
-								const verificationRequest =
-									hasBodyMethod && ctx.body !== undefined
-										? new Request(sourceRequest.url, {
+								const verificationRequest = hasBodyMethod
+									? (() => {
+										const headers = new Headers(sourceRequest.headers);
+										headers.delete("content-length");
+										const body =
+											ctx.body === undefined ? undefined : JSON.stringify(ctx.body);
+										return new Request(sourceRequest.url, {
 											method: sourceRequest.method,
-											headers: sourceRequest.headers,
-											body: JSON.stringify(ctx.body),
-										})
-										: sourceRequest;
+											headers,
+											body,
+										});
+									})()
+									: sourceRequest;
 
 								const result = await verifier.verifyRequest({
 									request: verificationRequest,
@@ -833,7 +913,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								for (const [sig, value] of verificationCache) {
 									if (
 										value.keyId === result.params.keyid &&
-										value.created < notBefore
+										value.created <= notBefore
 									) {
 										verificationCache.delete(sig);
 									}
