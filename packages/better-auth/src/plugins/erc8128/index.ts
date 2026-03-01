@@ -294,7 +294,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 												}>({
 													model: "erc8128Invalidation",
 													where: [
-														{ field: "keyId", operator: "eq", value: keyid },
+														{ field: "keyId", operator: "eq", value: keyid.toLowerCase() },
 													],
 												});
 												return record?.notBefore ?? null;
@@ -326,7 +326,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								}>({
 									model: "erc8128Invalidation",
 									where: [
-										{ field: "keyId", operator: "eq", value: cached.keyId },
+										{ field: "keyId", operator: "eq", value: cached.keyId.toLowerCase() },
 									],
 								});
 
@@ -343,7 +343,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 										params: {
 											created: cached.created,
 											expires: cached.expires,
-											keyid: cached.keyId,
+											keyid: cached.keyId.toLowerCase(),
 										},
 										replayable: true,
 										binding: "class-bound",
@@ -401,7 +401,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							);
 						}
 
-						if (result.replayable && options.allowReplayable) {
+						if (options.allowReplayable) {
 							const notBeforeRecord = await ctx.context.adapter.findOne<{
 								notBefore: number;
 							}>({
@@ -410,7 +410,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									{
 										field: "keyId",
 										operator: "eq",
-										value: result.params.keyid,
+										value: result.params.keyid.toLowerCase(),
 									},
 								],
 							});
@@ -438,43 +438,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							}
 						}
 
-						// Check notBefore for replayable sigs (invalidation support)
-						if (result.replayable && options.allowReplayable) {
-							const nbRecord = await ctx.context.adapter.findOne<{
-								notBefore: number;
-							}>({
-								model: "erc8128Invalidation",
-								where: [
-									{
-										field: "keyId",
-										operator: "eq",
-										value: result.params.keyid,
-									},
-								],
-							});
-							if (
-								nbRecord &&
-								result.params.created < nbRecord.notBefore
-							) {
-								if (!resolvedRoutePolicy.requireAuth) {
-									return;
-								}
-								return new Response(
-									JSON.stringify({
-										error: "erc8128_verification_failed",
-										reason: "replayable_invalidated",
-										detail: "Replayable signature was invalidated",
-									}),
-									{
-										status: 401,
-										headers: {
-											"Content-Type": "application/json",
-											...responseHeaders,
-										},
-									},
-								);
-							}
-						}
 
 						// Cache replayable verification result (LRU eviction)
 						if (signature && result.replayable && options.allowReplayable) {
@@ -484,7 +447,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							verificationCache.set(signature, {
 								address: result.address,
 								chainId: result.chainId,
-								keyId: result.params.keyid,
+								keyId: result.params.keyid.toLowerCase(),
 								expires: result.params.expires,
 								created: result.params.created,
 							});
@@ -878,7 +841,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 										{
 											field: "keyId",
 											operator: "eq",
-											value: result.params.keyid,
+											value: result.params.keyid.toLowerCase(),
 										},
 									],
 								});
@@ -887,7 +850,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									await ctx.context.adapter.create({
 										model: "erc8128Invalidation",
 										data: {
-											keyId: result.params.keyid,
+											keyId: result.params.keyid.toLowerCase(),
 											notBefore,
 											updatedAt: new Date(),
 										},
@@ -912,7 +875,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								// Evict cached entries that are now invalidated
 								for (const [sig, value] of verificationCache) {
 									if (
-										value.keyId === result.params.keyid &&
+										value.keyId.toLowerCase() === result.params.keyid.toLowerCase() &&
 										value.created <= notBefore
 									) {
 										verificationCache.delete(sig);
