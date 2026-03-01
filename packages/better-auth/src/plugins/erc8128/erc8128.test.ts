@@ -488,6 +488,54 @@ describe("erc8128 plugin", () => {
 			expect(verifySpy).toHaveBeenCalledTimes(2); // one for /verify + one for first /get-session
 		});
 
+
+		it("lazily sweeps expired cache entries on cache access", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+			try {
+				const verifySpy = vi.fn(async ({ request }: { request: Request }) => {
+					if (request.url.endsWith("/verify")) {
+						return okResult({ replayable: false });
+					}
+					const now = Math.floor(Date.now() / 1000);
+					return okResult({ replayable: true, created: now, expires: now + 30 });
+				});
+
+				vi.mocked(createVerifierClient).mockImplementation(() => ({
+					verifyRequest: verifySpy,
+				}));
+
+				const { auth } = await getTestInstance({
+					plugins: [
+						erc8128({
+							verifyMessage: async () => true,
+							allowReplayable: true,
+						}),
+					],
+				});
+
+				await post(auth, "/erc8128/verify");
+
+				await get(auth, "/get-session", {
+					headers: { authorization: "ERC-8128 replayable", signature: "sig-a" },
+				});
+
+				vi.advanceTimersByTime(61_000);
+
+				await get(auth, "/get-session", {
+					headers: { authorization: "ERC-8128 replayable", signature: "sig-a" },
+				});
+
+				const sigAVerifications = verifySpy.mock.calls.filter(([arg]) =>
+					arg.request.headers.get("signature") === "sig-a",
+				);
+				expect(sigAVerifications).toHaveLength(2);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
 		it("rejects expired replayable signatures", async () => {
 			mockVerifier(async () => failResult("expired"));
 			const { auth } = await getTestInstance({

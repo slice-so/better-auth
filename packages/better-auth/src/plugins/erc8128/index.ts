@@ -45,6 +45,13 @@ export interface ERC8128PluginOptions {
 	anonymous?: boolean | undefined;
 	ensLookup?: ((args: ENSLookupArgs) => Promise<ENSLookupResult>) | undefined;
 	schema?: InferOptionSchema<typeof schema> | undefined;
+	/**
+	 * Max number of replayable signature entries to keep in memory.
+	 *
+	 * This cache is per-process only (not shared across instances), matching
+	 * Better Auth's cookieCache model.
+	 */
+	cacheSize?: number | undefined;
 }
 
 const invalidateBodySchema = z
@@ -61,10 +68,33 @@ type CacheValue = {
 	created: number;
 };
 
-const MAX_CACHE_SIZE = 10_000;
+const DEFAULT_CACHE_SIZE = 10_000;
+const CACHE_SWEEP_INTERVAL_MS = 60_000;
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
+	/**
+	 * Replayable signature verification cache (same operational model as cookieCache):
+	 * - in-memory and per-process only (not shared across instances)
+	 * - bounded by signature natural expiry (maxValiditySec)
+	 * - intentionally simple (no external store/pluggable cache)
+	 */
 	const verificationCache = new Map<string, CacheValue>();
+	const maxCacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
+	let lastCacheSweepMs = 0;
+
+	const sweepExpiredCacheEntries = () => {
+		const nowMs = Date.now();
+		if (nowMs - lastCacheSweepMs < CACHE_SWEEP_INTERVAL_MS) {
+			return;
+		}
+		lastCacheSweepMs = nowMs;
+		const nowSec = Math.floor(nowMs / 1000);
+		for (const [sig, value] of verificationCache) {
+			if (value.expires < nowSec) {
+				verificationCache.delete(sig);
+			}
+		}
+	};
 
 	const verifyBodySchema = z
 		.object({
@@ -193,7 +223,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								expires: result.params.expires,
 								created: result.params.created,
 							});
-							if (verificationCache.size > MAX_CACHE_SIZE) {
+							if (verificationCache.size > maxCacheSize) {
 								const oldest = verificationCache.keys().next().value;
 								if (oldest) verificationCache.delete(oldest);
 							}
