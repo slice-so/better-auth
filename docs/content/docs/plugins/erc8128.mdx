@@ -1,0 +1,374 @@
+---
+title: ERC-8128
+description: Authenticate Ethereum requests with HTTP Message Signatures (ERC-8128)
+---
+
+The ERC-8128 plugin lets users authenticate requests using [ERC-8128](https://erc8128.slice.so), an Ethereum-native HTTP Message Signatures flow based on the ERC spec. Instead of SIWE’s challenge-response login exchange, ERC-8128 signs each request cryptographically, enabling both session-based sign-in and stateless per-request authentication.
+
+## Installation
+
+<Steps>
+    <Step>
+        ### Add the Server Plugin
+
+        Add the ERC-8128 plugin to your auth configuration:
+
+        ```ts title="auth.ts"
+        import { betterAuth } from "better-auth";
+        import { erc8128 } from "better-auth/plugins"; // [!code highlight]
+        import { verifyMessage } from "viem";
+
+        export const auth = betterAuth({
+            plugins: [
+                erc8128({
+                    // Required: verifies EOA + ERC-1271 signatures
+                    verifyMessage,
+
+                    // Optional: defaults to DB-backed nonce store
+                    // nonceStore: {
+                    //   consumeNonce: async (key) => true,
+                    //   putNonce: async (key, ttlSec) => {},
+                    // },
+
+                    // Optional: default verification policy for middleware requests
+                    // defaultPolicy: {
+                    //   replayable: false,
+                    //   binding: "request-bound",
+                    // },
+
+                    // Optional: create Better Auth session on /erc8128/verify
+                    createSession: true, // default: true
+                    sessionExpiresIn: 60 * 60 * 24 * 7, // optional, seconds
+
+                    // Optional: enable replayable signatures + invalidation endpoint
+                    allowReplayable: false, // default: false
+
+                    // Optional: verification window and tolerance
+                    maxValiditySec: 300, // default: 300
+                    clockSkewSec: 30, // default: 30
+
+                    // Optional: in-memory cache size for replayable verification
+                    cacheSize: 10_000, // default: 10000
+
+                    // Optional: user creation controls for /erc8128/verify
+                    emailDomainName: "example.com",
+                    anonymous: true, // default: true
+
+                    // Optional: resolve ENS profile data for newly created users
+                    // ensLookup: async ({ walletAddress }) => ({
+                    //   name: "vitalik.eth",
+                    //   avatar: "https://...",
+                    // }),
+                }),
+            ],
+        });
+        ```
+    </Step>
+
+    <Step>
+        ### Migrate the database
+
+        Run the migration or generate the schema to add the necessary fields and tables to the database.
+
+        <Tabs items={["migrate", "generate"]}>
+            <Tab value="migrate">
+            ```package-install
+            npx auth migrate
+            ```
+            </Tab>
+            <Tab value="generate">
+            ```package-install
+            npx auth generate
+            ```
+            </Tab>
+        </Tabs>
+
+        See the [Schema](#schema) section to add the fields manually.
+    </Step>
+
+    <Step>
+        ### Add the Client Plugin
+
+        ```ts title="auth-client.ts"
+        import { createAuthClient } from "better-auth/client";
+        import { erc8128Client } from "better-auth/client/plugins"; // [!code highlight]
+
+        export const authClient = createAuthClient({
+            plugins: [erc8128Client()], // [!code highlight]
+        });
+        ```
+    </Step>
+</Steps>
+
+## Usage
+
+### Basic auth (session creation)
+
+Use `@slicekit/erc8128` to sign a request to `/erc8128/verify`. If verification succeeds (and `createSession !== false`), Better Auth returns a session and sets the session cookie.
+
+```ts title="sign-in.ts"
+import { createSignerClient } from "@slicekit/erc8128";
+import { privateKeyToAccount } from "viem/accounts";
+
+const account = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
+
+const signer = createSignerClient({
+  account,
+  chainId: 1,
+  origin: "https://api.example.com",
+});
+
+const response = await signer.fetch("https://api.example.com/erc8128/verify", {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({
+    email: "user@example.com", // required when anonymous: false
+  }),
+});
+
+if (!response.ok) throw new Error("verify failed");
+
+// Browser clients automatically store the Set-Cookie header.
+const data = await response.json();
+console.log(data.user);
+```
+
+### Middleware auth (per-request)
+
+When a request contains an `Authorization: ERC-8128 ...` header, the plugin’s `hooks.before` verifier runs automatically. Valid requests continue to your endpoint with wallet authentication already checked.
+
+```ts title="middleware-request.ts"
+import { createSignerClient } from "@slicekit/erc8128";
+
+const signer = createSignerClient({
+  account,
+  chainId: 1,
+  origin: "https://api.example.com",
+});
+
+// Any protected route can be signed (not just /erc8128/verify)
+const res = await signer.fetch("https://api.example.com/api/protected", {
+  method: "GET",
+});
+```
+
+### Stateless mode (`createSession: false`)
+
+Set `createSession: false` to use pure signature authentication without creating Better Auth sessions.
+
+```ts title="auth.ts"
+import { betterAuth } from "better-auth";
+import { erc8128 } from "better-auth/plugins";
+import { verifyMessage } from "viem";
+
+export const auth = betterAuth({
+  plugins: [
+    erc8128({
+      verifyMessage,
+      createSession: false,
+    }),
+  ],
+});
+```
+
+<Callout>
+  In stateless mode, `/erc8128/verify` still verifies signatures and can create/link users, but it returns JSON only and does not set a session cookie.
+</Callout>
+
+### Replayable signatures
+
+Replayable signatures are useful for short-lived automation and backend-to-backend calls where re-signing every request is expensive.
+
+```ts title="auth.ts"
+import { betterAuth } from "better-auth";
+import { erc8128 } from "better-auth/plugins";
+import { verifyMessage } from "viem";
+
+export const auth = betterAuth({
+  plugins: [
+    erc8128({
+      verifyMessage,
+      allowReplayable: true,
+      maxValiditySec: 300,
+    }),
+  ],
+});
+```
+
+Invalidate old replayable signatures with `POST /erc8128/invalidate` (signed request required):
+
+```ts title="invalidate.ts"
+await signer.fetch("https://api.example.com/erc8128/invalidate", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    // Optional: invalidate signatures created before this unix timestamp
+    notBefore: Math.floor(Date.now() / 1000),
+  }),
+});
+```
+
+### With wagmi/viem
+
+You can build an `EthHttpSigner` from a wagmi wallet client and use it with `createSignerClient`.
+
+```ts title="wagmi-erc8128.ts"
+import { createSignerClient, type EthHttpSigner } from "@slicekit/erc8128";
+import { getWalletClient } from "@wagmi/core";
+import { config } from "./wagmi";
+
+const walletClient = await getWalletClient(config);
+if (!walletClient || !walletClient.account) {
+  throw new Error("Wallet not connected");
+}
+
+const signer: EthHttpSigner = {
+  address: walletClient.account.address,
+  chainId: walletClient.chain.id,
+  async signMessage(message) {
+    return walletClient.signMessage({
+      account: walletClient.account!,
+      message,
+    });
+  },
+};
+
+const client = createSignerClient({
+  signer,
+  origin: "https://api.example.com",
+});
+
+await client.fetch("https://api.example.com/erc8128/verify", {
+  method: "POST",
+});
+```
+
+## Configuration options
+
+`erc8128()` accepts the following `ERC8128PluginOptions`:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `verifyMessage` | `VerifyMessageFn` | — (required) | Signature verifier used by the ERC-8128 verifier client. |
+| `nonceStore` | `NonceStore` | DB-backed adapter store | Custom nonce storage for replay protection. |
+| `defaultPolicy` | `VerifyPolicy` | `undefined` | Default verification policy for middleware verification. |
+| `createSession` | `boolean` | `true` | Whether `/erc8128/verify` and middleware should create Better Auth sessions for known wallets. |
+| `sessionExpiresIn` | `number` | `undefined` | Custom session TTL in seconds when creating a session via `/erc8128/verify`. |
+| `allowReplayable` | `boolean` | `false` | Enables replayable signatures and the `/erc8128/invalidate` endpoint. |
+| `maxValiditySec` | `number` | `300` | Maximum signature validity window in seconds. |
+| `clockSkewSec` | `number` | `30` | Allowed clock skew in seconds for `created`/`expires` checks. |
+| `cacheSize` | `number` | `10000` | In-memory per-process cache size for replayable signature verification results. |
+| `emailDomainName` | `string` | Derived from `baseURL` origin | Domain used for generated email when creating users in anonymous mode. |
+| `anonymous` | `boolean` | `true` | If `false`, `email` is required when verifying. |
+| `ensLookup` | `(args: ENSLookupArgs) => Promise<ENSLookupResult>` | `undefined` | Optional ENS resolver for new user name/avatar hydration. |
+
+## Endpoints
+
+### `POST /erc8128/verify`
+
+Verifies an ERC-8128 signed HTTP request.
+
+- Requires signed `Authorization` + `Signature` headers.
+- Accepts optional JSON body `{ email?: string }`.
+- Creates/fetches user by wallet address (+ chain), links wallet records, and optionally creates a session.
+
+### `POST /erc8128/invalidate`
+
+Available only when `allowReplayable: true`.
+
+- Requires a valid signed request.
+- Body: `{ notBefore?: number }`.
+- Invalidates replayable signatures for the signer key id created before `notBefore` (or now).
+
+### `GET /.well-known/erc8128`
+
+Returns ERC-8128 verifier metadata for clients:
+
+- verification endpoint URL
+- invalidation endpoint URL (if replayable enabled)
+- supported algorithms/account types
+- replay policy and timing constraints
+
+## NonceStore
+
+By default, the plugin uses a DB-backed nonce store. You can provide your own store (for example Redis) for distributed deployments.
+
+```ts title="auth.ts"
+import Redis from "ioredis";
+import { betterAuth } from "better-auth";
+import { erc8128 } from "better-auth/plugins";
+import { verifyMessage } from "viem";
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+const nonceStore = {
+  async putNonce(key: string, ttlSec: number) {
+    await redis.set(`erc8128:nonce:${key}`, "1", "EX", ttlSec, "NX");
+  },
+  async consumeNonce(key: string) {
+    const result = await redis.del(`erc8128:nonce:${key}`);
+    return result > 0;
+  },
+};
+
+export const auth = betterAuth({
+  plugins: [
+    erc8128({
+      verifyMessage,
+      nonceStore,
+    }),
+  ],
+});
+```
+
+## Schema
+
+### `walletAddress`
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `userId` | `string` | Reference to `user.id` |
+| `address` | `string` | Ethereum wallet address |
+| `chainId` | `number` | EVM chain id |
+| `isPrimary` | `boolean` | Primary wallet marker |
+| `createdAt` | `date` | Creation timestamp |
+
+### `erc8128Invalidation`
+
+Created only when `allowReplayable: true`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `keyId` | `string` | ERC-8128 key id (`erc8128:<chainId>:<address>`) |
+| `notBefore` | `number` | Unix timestamp cutoff for valid replayable signatures |
+| `updatedAt` | `date` | Last invalidation update timestamp |
+
+## Middleware behavior
+
+The plugin registers a `hooks.before` middleware that:
+
+1. Detects requests with `Authorization: ERC-8128 ...`.
+2. Verifies the signature using `createVerifierClient`.
+3. Optionally uses replayable cache/invalidation checks when enabled.
+4. If the wallet is already linked and `createSession !== false`, creates a session and injects the session cookie into request context.
+
+What it **does not** do:
+
+- It does not create users or wallet links in middleware-only requests.
+- It does not block non-ERC-8128 requests; unmatched requests fall through normally.
+
+## Migration from SIWE
+
+You can migrate incrementally without downtime:
+
+1. Keep SIWE enabled and add ERC-8128 alongside it.
+2. Reuse the shared `walletAddress` table for wallet identity mapping.
+3. Move clients/routes gradually from SIWE nonce+verify flow to signed HTTP requests.
+4. Keep both plugins active until all clients are migrated.
+5. Remove SIWE once no clients depend on it.
+
+## Smart Contract Accounts
+
+ERC-8128 works with both EOAs and smart contract wallets (ERC-1271). If you use viem’s `verifyMessage`, ERC-1271 contract signature checks are handled by your verifier implementation automatically.
