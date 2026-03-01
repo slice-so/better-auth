@@ -1,17 +1,16 @@
+import type { VerifyResult } from "@slicekit/erc8128";
+import { createVerifierClient, formatKeyId } from "@slicekit/erc8128";
 import { describe, expect, it, vi } from "vitest";
-import {
-	createVerifierClient,
-	formatKeyId,
-	type VerifyResult,
-} from "@slicekit/erc8128";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { erc8128 } from "./index";
 import { schema as erc8128Schema, walletAddressSchema } from "./schema";
+import type { WalletAddress } from "./types";
 
 vi.mock("@slicekit/erc8128", async () => {
-	const actual = await vi.importActual<typeof import("@slicekit/erc8128")>(
-		"@slicekit/erc8128",
-	);
+	const actual =
+		await vi.importActual<typeof import("@slicekit/erc8128")>(
+			"@slicekit/erc8128",
+		);
 
 	return {
 		...actual,
@@ -52,22 +51,32 @@ function okResult(args?: {
 	};
 }
 
-function failResult(reason: VerifyResult extends { ok: false; reason: infer R }
-	? R
-	: never): VerifyResult {
+function failResult(
+	reason: Extract<VerifyResult, { ok: false }>["reason"],
+): VerifyResult {
 	return {
 		ok: false,
 		reason,
 	};
 }
 
-function mockVerifier(fn: (args: { request: Request }) => Promise<VerifyResult>) {
+function mockVerifier(
+	fn: (args: { request: Request }) => Promise<VerifyResult>,
+) {
 	vi.mocked(createVerifierClient).mockImplementation(() => ({
 		verifyRequest: vi.fn(fn),
 	}));
 }
 
-async function post(auth: any, path: string, init?: { headers?: HeadersInit; body?: any }) {
+interface TestAuth {
+	handler: (request: Request) => Promise<Response>;
+}
+
+async function post(
+	auth: TestAuth,
+	path: string,
+	init?: { headers?: HeadersInit; body?: Record<string, unknown> },
+) {
 	const response = await auth.handler(
 		new Request(`http://localhost:3000/api/auth${path}`, {
 			method: "POST",
@@ -82,7 +91,11 @@ async function post(auth: any, path: string, init?: { headers?: HeadersInit; bod
 	return { response, data };
 }
 
-async function get(auth: any, path: string, init?: { headers?: HeadersInit }) {
+async function get(
+	auth: TestAuth,
+	path: string,
+	init?: { headers?: HeadersInit },
+) {
 	const response = await auth.handler(
 		new Request(`http://localhost:3000/api/auth${path}`, {
 			method: "GET",
@@ -128,16 +141,18 @@ describe("erc8128 plugin", () => {
 
 			const ctx = await auth.$context;
 			const users = await ctx.adapter.findMany({ model: "user" });
-			const walletAddresses = await ctx.adapter.findMany({
+			const walletAddresses = await ctx.adapter.findMany<WalletAddress>({
 				model: "walletAddress",
 				where: [{ field: "address", operator: "eq", value: defaultAddress }],
 			});
-			const accounts = await ctx.adapter.findMany({ model: "account" });
+			const accounts = await ctx.adapter.findMany<{ providerId: string }>({
+				model: "account",
+			});
 			const sessions = await ctx.adapter.findMany({ model: "session" });
 
 			expect(users.length).toBe(2); // default test user + new wallet user
 			expect(walletAddresses).toHaveLength(1);
-			expect(accounts.some((a: any) => a.providerId === "erc8128")).toBe(true);
+			expect(accounts.some((a) => a.providerId === "erc8128")).toBe(true);
 			expect(sessions.length).toBeGreaterThan(0);
 		});
 
@@ -181,13 +196,17 @@ describe("erc8128 plugin", () => {
 			expect(eth.data.user.id).toBe(polygon.data.user.id);
 
 			const ctx = await auth.$context;
-			const walletAddresses = await ctx.adapter.findMany({
+			const walletAddresses = await ctx.adapter.findMany<WalletAddress>({
 				model: "walletAddress",
 				where: [{ field: "address", operator: "eq", value: defaultAddress }],
 			});
 			expect(walletAddresses).toHaveLength(2);
-			expect(walletAddresses.find((w: any) => w.chainId === 1)?.isPrimary).toBe(true);
-			expect(walletAddresses.find((w: any) => w.chainId === 137)?.isPrimary).toBe(false);
+			expect(walletAddresses.find((w) => w.chainId === 1)?.isPrimary).toBe(
+				true,
+			);
+			expect(walletAddresses.find((w) => w.chainId === 137)?.isPrimary).toBe(
+				false,
+			);
 		});
 
 		it("returns 401 for invalid/expired/tampered signature", async () => {
@@ -256,7 +275,9 @@ describe("erc8128 plugin", () => {
 
 			const { data, response } = await get(auth, "/get-session");
 			expect(response.status).toBe(200);
-			expect(data === null || (data.session === null && data.user === null)).toBe(true);
+			expect(
+				data === null || (data.session === null && data.user === null),
+			).toBe(true);
 		});
 
 		it("invalid ERC-8128 header passes through and falls back to session cookie", async () => {
@@ -270,7 +291,9 @@ describe("erc8128 plugin", () => {
 			});
 
 			const verified = await post(auth, "/erc8128/verify");
-			const cookie = cookieFromSetCookie(verified.response.headers.get("set-cookie"));
+			const cookie = cookieFromSetCookie(
+				verified.response.headers.get("set-cookie"),
+			);
 			const { data, response } = await get(auth, "/get-session", {
 				headers: {
 					authorization: "ERC-8128 invalid",
@@ -312,7 +335,7 @@ describe("erc8128 plugin", () => {
 			expect(data.invalidatedBefore).toBe(notBefore);
 
 			const ctx = await auth.$context;
-			const invalidation = await ctx.adapter.findOne({
+			const invalidation = await ctx.adapter.findOne<{ notBefore: number }>({
 				model: "erc8128Invalidation",
 				where: [{ field: "keyId", operator: "eq", value: keyId }],
 			});

@@ -1,15 +1,12 @@
 import type { NonceStore } from "@slicekit/erc8128";
 
 interface VerificationAdapter {
-	findVerificationValue(identifier: string): Promise<
-		| {
-				id: string;
-				identifier: string;
-				value: string;
-				expiresAt: Date;
-		  }
-		| null
-	>;
+	findVerificationValue(identifier: string): Promise<{
+		id: string;
+		identifier: string;
+		value: string;
+		expiresAt: Date;
+	} | null>;
 	createVerificationValue(data: {
 		identifier: string;
 		value: string;
