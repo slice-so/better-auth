@@ -16,6 +16,7 @@ import { APIError } from "../../api";
 import { setSessionCookie } from "../../cookies";
 import { mergeSchema } from "../../db/schema";
 import type { InferOptionSchema, User } from "../../types";
+import { HIDE_METADATA } from "../../utils/hide-metadata";
 import { getOrigin } from "../../utils/url";
 import { createAdapterNonceStore } from "./nonce-store";
 import type { ERC8128Schema } from "./schema";
@@ -243,6 +244,34 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			],
 		},
 		endpoints: {
+			getErc8128Config: createAuthEndpoint(
+				"/.well-known/erc8128",
+				{
+					method: "GET",
+					metadata: HIDE_METADATA,
+				},
+				async (ctx) => {
+					const baseURL = ctx.context.baseURL;
+					return ctx.json({
+						verification_endpoint: `${baseURL}/erc8128/verify`,
+						...(options.allowReplayable
+							? { invalidation_endpoint: `${baseURL}/erc8128/invalidate` }
+							: {}),
+						signing_algorithms: ["eip191"],
+						account_types: ["eoa", "erc1271"],
+						replay_protection: {
+							non_replayable: true,
+							replayable: options.allowReplayable ?? false,
+						},
+						max_validity_sec: options.maxValiditySec ?? 300,
+						clock_skew_sec: options.clockSkewSec ?? 30,
+						keyid_format: "erc8128:<chainId>:<address>",
+						signature_scheme: "rfc9421",
+						default_binding: "request-bound",
+						session_creation: options.createSession !== false,
+					});
+				},
+			),
 			verifyErc8128: createAuthEndpoint(
 				"/erc8128/verify",
 				{

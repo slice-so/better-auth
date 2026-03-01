@@ -124,6 +124,61 @@ describe("erc8128 plugin", () => {
 		expect(replayable.schema.erc8128Invalidation).toBeDefined();
 	});
 
+	describe("GET /.well-known/erc8128", () => {
+		it("returns discovery metadata", async () => {
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						maxValiditySec: 120,
+						clockSkewSec: 15,
+						createSession: false,
+					}),
+				],
+			});
+
+			const { response, data } = await get(auth, "/.well-known/erc8128");
+			expect(response.status).toBe(200);
+			expect(data).toEqual({
+				verification_endpoint: "http://localhost:3000/api/auth/erc8128/verify",
+				signing_algorithms: ["eip191"],
+				account_types: ["eoa", "erc1271"],
+				replay_protection: {
+					non_replayable: true,
+					replayable: false,
+				},
+				max_validity_sec: 120,
+				clock_skew_sec: 15,
+				keyid_format: "erc8128:<chainId>:<address>",
+				signature_scheme: "rfc9421",
+				default_binding: "request-bound",
+				session_creation: false,
+			});
+			expect(data.invalidation_endpoint).toBeUndefined();
+		});
+
+		it("includes invalidation endpoint when replayable signatures are enabled", async () => {
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						allowReplayable: true,
+					}),
+				],
+			});
+
+			const { response, data } = await get(auth, "/.well-known/erc8128");
+			expect(response.status).toBe(200);
+			expect(data.invalidation_endpoint).toBe(
+				"http://localhost:3000/api/auth/erc8128/invalidate",
+			);
+			expect(data.replay_protection).toEqual({
+				non_replayable: true,
+				replayable: true,
+			});
+		});
+	});
+
 	describe("POST /erc8128/verify", () => {
 		it("creates user + walletAddress + account + session and sets cookie for valid signature", async () => {
 			mockVerifier(async () => okResult());
