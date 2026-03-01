@@ -92,6 +92,27 @@ type ResolvedRoutePolicy =
 		skipVerification: true;
 	  };
 
+const pluginPaths = [
+	"/erc8128/verify",
+	"/erc8128/invalidate",
+	"/.well-known/erc8128",
+];
+
+function isPluginEndpoint(request: Request, baseURL?: string) {
+	const pathname = new URL(request.url).pathname;
+	const basePath = baseURL ? new URL(baseURL).pathname : "";
+	const normalizedBasePath =
+		basePath && basePath !== "/" ? basePath.replace(/\/$/, "") : "";
+	const relativePath =
+		normalizedBasePath && pathname.startsWith(normalizedBasePath)
+			? pathname.slice(normalizedBasePath.length) || "/"
+			: pathname;
+
+	return pluginPaths.some(
+		(p) => pathname.endsWith(p) || relativePath.endsWith(p),
+	);
+}
+
 function resolveRoutePolicy(
 	routePolicy: ERC8128PluginOptions["routePolicy"],
 	request: Request,
@@ -179,6 +200,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				{
 					matcher(context: { request?: Request; headers?: Headers }) {
 						if (context.request) {
+						if (isPluginEndpoint(context.request)) {
+							return false;
+						}
+
 							const resolvedRoutePolicy = resolveRoutePolicy(
 								options.routePolicy,
 								context.request,
@@ -206,6 +231,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					handler: createAuthMiddleware(async (ctx) => {
 						const incomingHeaders = (ctx.request?.headers || ctx.headers) as Headers | undefined;
 						if (!incomingHeaders) {
+							return;
+						}
+
+						if (ctx.request && isPluginEndpoint(ctx.request, ctx.context.baseURL)) {
 							return;
 						}
 
