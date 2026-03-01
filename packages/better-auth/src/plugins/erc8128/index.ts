@@ -173,6 +173,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						// Check replayable signature cache before full verification
 						let result: VerifyResult | null = null;
 						if (signature && options.allowReplayable) {
+							sweepExpiredCacheEntries();
 							const cached = verificationCache.get(signature);
 							if (cached && cached.expires > Math.floor(Date.now() / 1000)) {
 								const notBeforeRecord = await ctx.context.adapter.findOne<{
