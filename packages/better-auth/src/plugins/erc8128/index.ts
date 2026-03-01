@@ -18,6 +18,7 @@ import { mergeSchema } from "../../db/schema";
 import type { InferOptionSchema, User } from "../../types";
 import { HIDE_METADATA } from "../../utils/hide-metadata";
 import { getOrigin } from "../../utils/url";
+import { wildcardMatch } from "../../utils/wildcard";
 import { createAdapterNonceStore } from "./nonce-store";
 import type { ERC8128Schema } from "./schema";
 import { schema, walletAddressSchema } from "./schema";
@@ -52,6 +53,9 @@ export interface ERC8128PluginOptions {
 	 * Better Auth's cookieCache model.
 	 */
 	cacheSize?: number | undefined;
+	routePolicy?: (Record<string, VerifyPolicy | false> & {
+		default?: VerifyPolicy;
+	}) | undefined;
 }
 
 const invalidateBodySchema = z
@@ -70,6 +74,63 @@ type CacheValue = {
 
 const DEFAULT_CACHE_SIZE = 10_000;
 const CACHE_SWEEP_INTERVAL_MS = 60_000;
+
+type ResolvedRoutePolicy =
+	| {
+		policy?: VerifyPolicy;
+		requireAuth: false;
+		skipVerification: false;
+	  }
+	| {
+		policy: VerifyPolicy;
+		requireAuth: true;
+		skipVerification: false;
+	  }
+	| {
+		policy?: VerifyPolicy;
+		requireAuth: false;
+		skipVerification: true;
+	  };
+
+function resolveRoutePolicy(
+	routePolicy: ERC8128PluginOptions["routePolicy"],
+	request: Request,
+): ResolvedRoutePolicy {
+	if (!routePolicy) {
+		return { requireAuth: false, skipVerification: false };
+	}
+
+	const routeKey = `${request.method.toUpperCase()} ${new URL(request.url).pathname}`;
+	const entries = Object.entries(routePolicy).filter(([key]) => key !== "default");
+
+	const exactMatch = entries.find(([key]) => key === routeKey);
+	const wildcardEntry =
+		exactMatch ??
+		entries.find(([pattern]) => {
+			if (!pattern.includes("*")) {
+				return false;
+			}
+			return wildcardMatch(pattern)(routeKey);
+		});
+
+	if (wildcardEntry) {
+		const [, policy] = wildcardEntry;
+		if (policy === false) {
+			return { requireAuth: false, skipVerification: true };
+		}
+		return { policy, requireAuth: true, skipVerification: false };
+	}
+
+	if (routePolicy.default) {
+		return {
+			policy: routePolicy.default,
+			requireAuth: true,
+			skipVerification: false,
+		};
+	}
+
+	return { requireAuth: false, skipVerification: false };
+}
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
 	/**
@@ -170,9 +231,23 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							ctx.headers?.get("signature") ||
 							null;
 
+						const resolvedRoutePolicy = resolveRoutePolicy(
+							options.routePolicy,
+							ctx.request!,
+						);
+						if (resolvedRoutePolicy.skipVerification) {
+							return;
+						}
+
+						const responseHeaders: Record<string, string> = {};
+
 						// Check replayable signature cache before full verification
 						let result: VerifyResult | null = null;
-						if (signature && options.allowReplayable) {
+						if (
+							signature &&
+							options.allowReplayable &&
+							!resolvedRoutePolicy.policy
+						) {
 							sweepExpiredCacheEntries();
 							const cached = verificationCache.get(signature);
 							if (cached && cached.expires > Math.floor(Date.now() / 1000)) {
@@ -207,9 +282,31 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							}
 						}
 
-						result ??= await verifier.verifyRequest({ request: ctx.request! });
+						result ??= await verifier.verifyRequest({
+							request: ctx.request!,
+							policy: resolvedRoutePolicy.policy,
+							setHeaders: (name, value) => {
+								responseHeaders[name] = value;
+							},
+						});
 						if (!result.ok) {
-							return;
+							if (!resolvedRoutePolicy.requireAuth) {
+								return;
+							}
+							return new Response(
+								JSON.stringify({
+									error: "erc8128_verification_failed",
+									reason: result.reason,
+									detail: result.detail,
+								}),
+								{
+									status: 401,
+									headers: {
+										"Content-Type": "application/json",
+										...responseHeaders,
+									},
+								},
+							);
 						}
 
 						// Cache replayable verification result (LRU eviction)
@@ -283,6 +380,13 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				},
 				async (ctx) => {
 					const baseURL = ctx.context.baseURL;
+					const routePolicies = options.routePolicy
+						? Object.fromEntries(
+								Object.entries(options.routePolicy).filter(
+									([key, value]) => key !== "default" && value !== false,
+								),
+							)
+						: undefined;
 					return ctx.json({
 						verification_endpoint: `${baseURL}/erc8128/verify`,
 						...(options.allowReplayable
@@ -300,6 +404,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						signature_scheme: "rfc9421",
 						default_binding: "request-bound",
 						session_creation: options.createSession !== false,
+						...(routePolicies ? { route_policies: routePolicies } : {}),
 					});
 				},
 			),
@@ -326,14 +431,28 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						},
 					});
 
+					const responseHeaders: Record<string, string> = {};
 					const result = await verifier.verifyRequest({
 						request: ctx.request!,
+						setHeaders: (name, value) => {
+							responseHeaders[name] = value;
+						},
 					});
 					if (!result.ok) {
-						throw APIError.fromStatus("UNAUTHORIZED", {
-							message: `Unauthorized: ${result.reason}`,
-							status: 401,
-						});
+						return new Response(
+							JSON.stringify({
+								error: "erc8128_verification_failed",
+								reason: result.reason,
+								detail: result.detail,
+							}),
+							{
+								status: 401,
+								headers: {
+									"Content-Type": "application/json",
+									...responseHeaders,
+								},
+							},
+						);
 					}
 
 					const key = parseErc8128KeyId(result.params.keyid);
@@ -524,14 +643,28 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									},
 								});
 
+								const responseHeaders: Record<string, string> = {};
 								const result = await verifier.verifyRequest({
 									request: ctx.request!,
+									setHeaders: (name, value) => {
+										responseHeaders[name] = value;
+									},
 								});
 								if (!result.ok) {
-									throw APIError.fromStatus("UNAUTHORIZED", {
-										message: `Unauthorized: ${result.reason}`,
-										status: 401,
-									});
+									return new Response(
+										JSON.stringify({
+											error: "erc8128_verification_failed",
+											reason: result.reason,
+											detail: result.detail,
+										}),
+										{
+											status: 401,
+											headers: {
+												"Content-Type": "application/json",
+												...responseHeaders,
+											},
+										},
+									);
 								}
 
 								const notBefore =

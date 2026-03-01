@@ -1,4 +1,4 @@
-import type { VerifyResult } from "@slicekit/erc8128";
+import type { VerifyPolicy, VerifyResult } from "@slicekit/erc8128";
 import { createVerifierClient, formatKeyId } from "@slicekit/erc8128";
 import { describe, expect, it, vi } from "vitest";
 import { getTestInstance } from "../../test-utils/test-instance";
@@ -61,7 +61,11 @@ function failResult(
 }
 
 function mockVerifier(
-	fn: (args: { request: Request }) => Promise<VerifyResult>,
+	fn: (args: {
+		request: Request;
+		policy?: VerifyPolicy;
+		setHeaders?: (name: string, value: string) => void;
+	}) => Promise<VerifyResult>,
 ) {
 	vi.mocked(createVerifierClient).mockImplementation(() => ({
 		verifyRequest: vi.fn(fn),
@@ -177,6 +181,29 @@ describe("erc8128 plugin", () => {
 				replayable: true,
 			});
 		});
+
+		it("includes route_policies when routePolicy is configured and omits false entries", async () => {
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							"GET /api/products/*": { replayable: true },
+							"POST /api/orders": { replayable: false },
+							"GET /api/public/*": false,
+							default: { replayable: false },
+						},
+					}),
+				],
+			});
+
+			const { response, data } = await get(auth, "/.well-known/erc8128");
+			expect(response.status).toBe(200);
+			expect(data.route_policies).toEqual({
+				"GET /api/products/*": { replayable: true },
+				"POST /api/orders": { replayable: false },
+			});
+		});
 	});
 
 	describe("POST /erc8128/verify", () => {
@@ -264,14 +291,22 @@ describe("erc8128 plugin", () => {
 			);
 		});
 
-		it("returns 401 for invalid/expired/tampered signature", async () => {
-			mockVerifier(async () => failResult("bad_signature"));
+		it("returns structured 401 with Accept-Signature for invalid/expired/tampered signature", async () => {
+			mockVerifier(async ({ setHeaders }) => {
+				setHeaders?.("Accept-Signature", 'sig=("@method" "@target-uri");alg="eip191"');
+				return failResult("bad_signature");
+			});
 			const { auth } = await getTestInstance({
 				plugins: [erc8128({ verifyMessage: async () => true })],
 			});
 
-			const { response } = await post(auth, "/erc8128/verify");
+			const { response, data } = await post(auth, "/erc8128/verify");
 			expect(response.status).toBe(401);
+			expect(response.headers.get("accept-signature")).toContain("@method");
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "bad_signature",
+			});
 		});
 
 		it("returns 401 for replayed nonce", async () => {
@@ -360,6 +395,152 @@ describe("erc8128 plugin", () => {
 			expect(data.session).toBeDefined();
 			expect(data.user).toBeDefined();
 		});
+
+		it("routePolicy exact match requires auth and returns structured 401 + Accept-Signature on failure", async () => {
+			mockVerifier(async ({ request, setHeaders }) => {
+				if (request.url.endsWith("/verify")) {
+					return okResult();
+				}
+				setHeaders?.("Accept-Signature", 'sig=("@method" "@target-uri");alg="eip191"');
+				return failResult("expired");
+			});
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							"GET /api/auth/get-session": { replayable: false },
+						},
+					}),
+				],
+			});
+
+			const { response, data } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 invalid",
+					signature: "bad-sig",
+				},
+			});
+			expect(response.status).toBe(401);
+			expect(response.headers.get("accept-signature")).toContain("@method");
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "expired",
+			});
+		});
+
+		it("routePolicy exact match passes through on valid signature", async () => {
+			mockVerifier(async () => okResult());
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							"GET /api/auth/get-session": { replayable: false },
+						},
+					}),
+				],
+			});
+
+			await post(auth, "/erc8128/verify");
+			const { response, data } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 valid",
+					signature: "sig-ok",
+				},
+			});
+			expect(response.status).toBe(200);
+			expect(data.session).toBeDefined();
+			expect(data.user).toBeDefined();
+		});
+
+		it("routePolicy wildcard + false skips verification entirely", async () => {
+			const verifySpy = vi.fn(async () => okResult());
+			vi.mocked(createVerifierClient).mockImplementation(() => ({
+				verifyRequest: verifySpy,
+			}));
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							"GET /api/auth/*": false,
+						},
+					}),
+				],
+			});
+
+			const { response } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 skipped",
+					signature: "sig-skip",
+				},
+			});
+			expect(response.status).toBe(200);
+			expect(verifySpy).not.toHaveBeenCalled();
+		});
+
+		it("routePolicy default requires auth for unmatched routes", async () => {
+			mockVerifier(async () => failResult("not_request_bound"));
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							default: { replayable: false },
+						},
+					}),
+				],
+			});
+
+			const { response, data } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 required-default",
+					signature: "sig-fail",
+				},
+			});
+			expect(response.status).toBe(401);
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "not_request_bound",
+			});
+		});
+
+		it("unmatched route without routePolicy.default uses opportunistic fallthrough", async () => {
+			mockVerifier(async ({ request }) => {
+				if (request.url.endsWith("/verify")) {
+					return okResult();
+				}
+				return failResult("bad_signature");
+			});
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							"POST /api/auth/erc8128/verify": { replayable: false },
+						},
+					}),
+				],
+			});
+
+			const verified = await post(auth, "/erc8128/verify");
+			const cookie = cookieFromSetCookie(
+				verified.response.headers.get("set-cookie"),
+			);
+			const { response, data } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 opportunistic",
+					signature: "sig-bad",
+					cookie,
+				},
+			});
+			expect(response.status).toBe(200);
+			expect(data.session).toBeDefined();
+			expect(data.user).toBeDefined();
+		});
 	});
 
 	describe("POST /erc8128/invalidate", () => {
@@ -397,8 +578,11 @@ describe("erc8128 plugin", () => {
 			expect(invalidation?.notBefore).toBe(notBefore);
 		});
 
-		it("replayable request to invalidation endpoint returns 401", async () => {
-			mockVerifier(async () => failResult("replayable_not_allowed"));
+		it("replayable request to invalidation endpoint returns structured 401 with Accept-Signature", async () => {
+			mockVerifier(async ({ setHeaders }) => {
+				setHeaders?.("Accept-Signature", 'sig=("@method" "@target-uri");alg="eip191"');
+				return failResult("replayable_not_allowed");
+			});
 			const { auth } = await getTestInstance({
 				plugins: [
 					erc8128({
@@ -408,8 +592,13 @@ describe("erc8128 plugin", () => {
 				],
 			});
 
-			const { response } = await post(auth, "/erc8128/invalidate");
+			const { response, data } = await post(auth, "/erc8128/invalidate");
 			expect(response.status).toBe(401);
+			expect(response.headers.get("accept-signature")).toContain("@method");
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "replayable_not_allowed",
+			});
 		});
 
 		it("after invalidation, old replayable signatures are rejected", async () => {

@@ -260,9 +260,55 @@ await client.fetch("https://api.example.com/erc8128/verify", {
 | `maxValiditySec` | `number` | `300` | Maximum signature validity window in seconds. |
 | `clockSkewSec` | `number` | `30` | Allowed clock skew in seconds for `created`/`expires` checks. |
 | `cacheSize` | `number` | `10000` | In-memory per-process cache size for replayable signature verification results. |
+| `routePolicy` | `Record<string, VerifyPolicy \| false> & { default?: VerifyPolicy }` | `undefined` | Per-route middleware policy map. Keys are `"METHOD /path"` patterns (`*` wildcard supported). `false` skips verification for matched route, and `default` enforces a fallback policy. |
 | `emailDomainName` | `string` | Derived from `baseURL` origin | Domain used for generated email when creating users in anonymous mode. |
 | `anonymous` | `boolean` | `true` | If `false`, `email` is required when verifying. |
 | `ensLookup` | `(args: ENSLookupArgs) => Promise<ENSLookupResult>` | `undefined` | Optional ENS resolver for new user name/avatar hydration. |
+
+## Route policy map (`routePolicy`)
+
+Use `routePolicy` to enforce different verification requirements per route in middleware.
+
+```ts title="auth.ts"
+erc8128({
+  verifyMessage,
+  routePolicy: {
+    "GET /api/products/*": { replayable: true },
+    "POST /api/orders": { replayable: false },
+    "GET /api/public/*": false, // skip verification
+    default: { replayable: false }, // enforce auth for unmatched routes
+  },
+});
+```
+
+How matching works:
+
+1. Build key from request: `"${method} ${path}"`.
+2. Try exact key match first.
+3. Then try wildcard matches (`*`).
+4. If matched value is `false`, verification is skipped for that route.
+5. If matched value is a `VerifyPolicy`, verification is required (`401` on failure).
+6. If no match and `default` exists, `default` policy is required.
+7. If no match and no `default`, middleware remains opportunistic (fallthrough on failure).
+
+## Error handling and `Accept-Signature`
+
+When verification is required (by `routePolicy`) and fails, middleware responds with:
+
+- Status `401`
+- `Content-Type: application/json`
+- `Accept-Signature: ...` (components expected by the verifier)
+- Body:
+
+```json
+{
+  "error": "erc8128_verification_failed",
+  "reason": "expired",
+  "detail": "optional detail"
+}
+```
+
+`POST /erc8128/verify` and `POST /erc8128/invalidate` use the same structured error shape and include `Accept-Signature` on verification failures.
 
 ## Endpoints
 
@@ -290,6 +336,7 @@ Returns ERC-8128 verifier metadata for clients:
 - invalidation endpoint URL (if replayable enabled)
 - supported algorithms/account types
 - replay policy and timing constraints
+- route policies (`route_policies`) when configured
 
 ## NonceStore
 
@@ -351,8 +398,10 @@ The plugin registers a `hooks.before` middleware that:
 
 1. Detects requests with `Authorization: ERC-8128 ...`.
 2. Verifies the signature using `createVerifierClient`.
-3. Optionally uses replayable cache/invalidation checks when enabled.
-4. If the wallet is already linked and `createSession !== false`, creates a session and injects the session cookie into request context.
+3. Resolves per-route `routePolicy` (exact + wildcard) when configured.
+4. Optionally uses replayable cache/invalidation checks when enabled.
+5. If verification is required by `routePolicy`, returns structured `401` on failure.
+6. If the wallet is already linked and `createSession !== false`, creates a session and injects the session cookie into request context.
 
 What it **does not** do:
 
