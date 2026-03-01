@@ -297,6 +297,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 														{ field: "keyId", operator: "eq", value: keyid.toLowerCase() },
 													],
 												});
+												console.log("[erc8128] replayableNotBefore lookup:", { keyid: keyid.toLowerCase(), notBefore: record?.notBefore ?? null });
 												return record?.notBefore ?? null;
 											},
 										}
@@ -830,7 +831,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								}
 
 								const notBefore =
-									ctx.body?.notBefore ?? Math.floor(Date.now() / 1000);
+									ctx.body?.notBefore ?? (Math.floor(Date.now() / 1000) + 1);
 
 								// Upsert invalidation record
 								const existing = await ctx.context.adapter.findOne<{
