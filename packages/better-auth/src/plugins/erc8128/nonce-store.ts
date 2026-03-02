@@ -19,7 +19,10 @@ export function createAdapterNonceStore(
 ): NonceStore {
 	const fallback = new Map<string, number>();
 
-	const consumeFromFallback = (identifier: string, ttlSeconds: number): boolean => {
+	const consumeFromFallback = (
+		identifier: string,
+		ttlSeconds: number,
+	): boolean => {
 		const now = Date.now();
 		for (const [key, expiresAt] of fallback) {
 			if (expiresAt <= now) {

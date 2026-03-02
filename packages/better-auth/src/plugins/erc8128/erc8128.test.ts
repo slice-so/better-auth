@@ -3,7 +3,7 @@ import { createVerifierClient, formatKeyId } from "@slicekit/erc8128";
 import { describe, expect, it, vi } from "vitest";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { erc8128 } from "./index";
-import { schema as erc8128Schema, walletAddressSchema } from "./schema";
+import { schema as erc8128Schema } from "./schema";
 import type { WalletAddress } from "./types";
 
 vi.mock("@slicekit/erc8128", async () => {
@@ -116,16 +116,16 @@ function cookieFromSetCookie(setCookie: string | null) {
 }
 
 describe("erc8128 plugin", () => {
-	it("registers walletAddress schema by default and invalidation schema when allowReplayable=true", () => {
+	it("always registers full schema including invalidation table", () => {
 		const base = erc8128({ verifyMessage: async () => true });
-		expect(base.schema).toEqual(walletAddressSchema);
+		expect(base.schema).toEqual(erc8128Schema);
+		expect(base.schema.erc8128Invalidation).toBeDefined();
 
 		const replayable = erc8128({
 			verifyMessage: async () => true,
 			allowReplayable: true,
 		});
 		expect(replayable.schema).toEqual(erc8128Schema);
-		expect(replayable.schema.erc8128Invalidation).toBeDefined();
 	});
 
 	describe("GET /.well-known/erc8128", () => {
@@ -293,7 +293,10 @@ describe("erc8128 plugin", () => {
 
 		it("returns structured 401 with Accept-Signature for invalid/expired/tampered signature", async () => {
 			mockVerifier(async ({ setHeaders }) => {
-				setHeaders?.("Accept-Signature", 'sig=("@method" "@target-uri");alg="eip191"');
+				setHeaders?.(
+					"Accept-Signature",
+					'sig=("@method" "@target-uri");alg="eip191"',
+				);
 				return failResult("bad_signature");
 			});
 			const { auth } = await getTestInstance({
@@ -401,7 +404,10 @@ describe("erc8128 plugin", () => {
 				if (request.url.endsWith("/verify")) {
 					return okResult();
 				}
-				setHeaders?.("Accept-Signature", 'sig=("@method" "@target-uri");alg="eip191"');
+				setHeaders?.(
+					"Accept-Signature",
+					'sig=("@method" "@target-uri");alg="eip191"',
+				);
 				return failResult("expired");
 			});
 
@@ -580,7 +586,10 @@ describe("erc8128 plugin", () => {
 
 		it("replayable request to invalidation endpoint returns structured 401 with Accept-Signature", async () => {
 			mockVerifier(async ({ setHeaders }) => {
-				setHeaders?.("Accept-Signature", 'sig=("@method" "@target-uri");alg="eip191"');
+				setHeaders?.(
+					"Accept-Signature",
+					'sig=("@method" "@target-uri");alg="eip191"',
+				);
 				return failResult("replayable_not_allowed");
 			});
 			const { auth } = await getTestInstance({
@@ -599,6 +608,109 @@ describe("erc8128 plugin", () => {
 				error: "erc8128_verification_failed",
 				reason: "replayable_not_allowed",
 			});
+		});
+
+		it("per-signature invalidation creates DB record and evicts from cache", async () => {
+			const keyId = formatKeyId(defaultChainId, defaultAddress);
+			const sigToInvalidate = "0xdeadbeef";
+			mockVerifier(async ({ request }) => {
+				if (request.url.endsWith("/invalidate")) {
+					return okResult({ keyId, replayable: false });
+				}
+				return okResult({ keyId, replayable: true });
+			});
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						allowReplayable: true,
+					}),
+				],
+			});
+
+			const { response, data } = await post(auth, "/erc8128/invalidate", {
+				body: { signature: sigToInvalidate },
+			});
+			expect(response.status).toBe(200);
+			expect(data.success).toBe(true);
+			expect(data.invalidatedSignature).toBe(sigToInvalidate);
+			// DB record should be created with the signature field
+			const ctx = await auth.$context;
+			const dbRecords = await ctx.adapter.findMany<{
+				signature?: string;
+			}>({
+				model: "erc8128Invalidation",
+			});
+			expect(dbRecords).toHaveLength(1);
+			expect(dbRecords[0]?.signature).toBe(sigToInvalidate);
+		});
+
+		it("rejects providing both notBefore and signature", async () => {
+			mockVerifier(async () => okResult({ replayable: false }));
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						allowReplayable: true,
+					}),
+				],
+			});
+
+			const { response } = await post(auth, "/erc8128/invalidate", {
+				body: {
+					notBefore: Math.floor(Date.now() / 1000) + 10,
+					signature: "0xdeadbeef",
+				},
+			});
+			// Zod refinement rejects mutually exclusive fields
+			expect(response.status).not.toBe(200);
+		});
+
+		it("per-signature invalidation is checked via parallel DB query in middleware", async () => {
+			const keyId = formatKeyId(defaultChainId, defaultAddress);
+			const sig = "0xdeadbeefcafe";
+
+			mockVerifier(async ({ request }) => {
+				if (request.url.endsWith("/verify")) {
+					return okResult({ keyId, replayable: false });
+				}
+				if (request.url.endsWith("/invalidate")) {
+					return okResult({ keyId, replayable: false });
+				}
+				return okResult({ keyId, replayable: true });
+			});
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						allowReplayable: true,
+					}),
+				],
+			});
+
+			// Create wallet user
+			await post(auth, "/erc8128/verify");
+
+			const headers = {
+				authorization: "ERC-8128 replayable",
+				signature: sig,
+			};
+
+			// Should work before invalidation
+			const before = await get(auth, "/get-session", { headers });
+			expect(before.data.session).toBeDefined();
+
+			// Invalidate the specific signature
+			const inv = await post(auth, "/erc8128/invalidate", {
+				body: { signature: sig },
+			});
+			expect(inv.data.invalidatedSignature).toBe(sig);
+
+			// After invalidation, parallel DB check rejects it
+			const after = await get(auth, "/get-session", { headers });
+			expect(after.data === null || after.data.session === null).toBe(true);
 		});
 
 		it("after invalidation, old replayable signatures are rejected", async () => {
@@ -677,7 +789,6 @@ describe("erc8128 plugin", () => {
 			expect(verifySpy).toHaveBeenCalledTimes(2); // one for /verify + one for first /get-session
 		});
 
-
 		it("lazily sweeps expired cache entries on cache access", async () => {
 			vi.useFakeTimers();
 			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
@@ -688,7 +799,11 @@ describe("erc8128 plugin", () => {
 						return okResult({ replayable: false });
 					}
 					const now = Math.floor(Date.now() / 1000);
-					return okResult({ replayable: true, created: now, expires: now + 30 });
+					return okResult({
+						replayable: true,
+						created: now,
+						expires: now + 30,
+					});
 				});
 
 				vi.mocked(createVerifierClient).mockImplementation(() => ({
@@ -716,8 +831,8 @@ describe("erc8128 plugin", () => {
 					headers: { authorization: "ERC-8128 replayable", signature: "sig-a" },
 				});
 
-				const sigAVerifications = verifySpy.mock.calls.filter(([arg]) =>
-					arg.request.headers.get("signature") === "sig-a",
+				const sigAVerifications = verifySpy.mock.calls.filter(
+					([arg]) => arg.request.headers.get("signature") === "sig-a",
 				);
 				expect(sigAVerifications).toHaveLength(2);
 			} finally {

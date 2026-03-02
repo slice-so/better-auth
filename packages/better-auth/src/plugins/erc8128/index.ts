@@ -1,10 +1,12 @@
-import type { BetterAuthPlugin } from "@better-auth/core";
+import type {
+	BetterAuthPlugin,
+	GenericEndpointContext,
+} from "@better-auth/core";
 import {
 	createAuthEndpoint,
 	createAuthMiddleware,
 } from "@better-auth/core/api";
 import type {
-	NonceStore,
 	VerifyMessageFn,
 	VerifyPolicy,
 	VerifyResult,
@@ -18,12 +20,17 @@ import { mergeSchema } from "../../db/schema";
 import type { InferOptionSchema, User } from "../../types";
 import { HIDE_METADATA } from "../../utils/hide-metadata";
 import { getOrigin } from "../../utils/url";
-import { wildcardMatch } from "../../utils/wildcard";
 import { createAdapterNonceStore } from "./nonce-store";
+import { isPluginEndpoint, resolveRoutePolicy } from "./route-policy";
 import type { ERC8128Schema } from "./schema";
-import { schema, walletAddressSchema } from "./schema";
+import { schema } from "./schema";
 import type { ENSLookupArgs, ENSLookupResult, WalletAddress } from "./types";
 import { parseErc8128KeyId } from "./utils";
+import type { CacheValue, VerificationCacheOps } from "./verification-cache";
+import {
+	createVerificationCacheOps,
+	DEFAULT_CACHE_SIZE,
+} from "./verification-cache";
 
 declare module "@better-auth/core" {
 	interface BetterAuthPluginRegistry<AuthOptions, Options> {
@@ -35,7 +42,6 @@ declare module "@better-auth/core" {
 
 export interface ERC8128PluginOptions {
 	verifyMessage: VerifyMessageFn;
-	nonceStore?: NonceStore | undefined;
 	defaultPolicy?: VerifyPolicy | undefined;
 	createSession?: boolean | undefined;
 	sessionExpiresIn?: number | undefined;
@@ -47,135 +53,50 @@ export interface ERC8128PluginOptions {
 	ensLookup?: ((args: ENSLookupArgs) => Promise<ENSLookupResult>) | undefined;
 	schema?: InferOptionSchema<typeof schema> | undefined;
 	/**
-	 * Max number of replayable signature entries to keep in memory.
+	 * Max entries in the in-memory verification cache. Used by the database
+	 * read-through Map and as the sole store when `secondaryStorage` is not
+	 * configured. Ignored when `secondaryStorage` is active (TTL-managed).
 	 *
-	 * This cache is per-process only (not shared across instances), matching
-	 * Better Auth's cookieCache model.
+	 * @default 10000
 	 */
 	cacheSize?: number | undefined;
-	routePolicy?: (Record<string, VerifyPolicy | false> & {
-		default?: VerifyPolicy;
-	}) | undefined;
+	routePolicy?:
+		| (Record<string, VerifyPolicy | false> & {
+				default?: VerifyPolicy;
+		  })
+		| undefined;
 }
 
 const invalidateBodySchema = z
 	.object({
 		notBefore: z.number().int().positive().optional(),
+		signature: z.string().startsWith("0x").optional(),
 	})
-	.optional();
-
-type CacheValue = {
-	address: string;
-	chainId: number;
-	keyId: string;
-	expires: number;
-	created: number;
-};
-
-const DEFAULT_CACHE_SIZE = 10_000;
-const CACHE_SWEEP_INTERVAL_MS = 60_000;
-
-type ResolvedRoutePolicy =
-	| {
-		policy?: VerifyPolicy;
-		requireAuth: false;
-		skipVerification: false;
-	  }
-	| {
-		policy: VerifyPolicy;
-		requireAuth: true;
-		skipVerification: false;
-	  }
-	| {
-		policy?: VerifyPolicy;
-		requireAuth: false;
-		skipVerification: true;
-	  };
-
-const pluginPaths = [
-	"/erc8128/verify",
-	"/erc8128/invalidate",
-	"/.well-known/erc8128",
-];
-
-function isPluginEndpoint(request: Request, baseURL?: string) {
-	const pathname = new URL(request.url).pathname;
-	const basePath = baseURL ? new URL(baseURL).pathname : "";
-	const normalizedBasePath =
-		basePath && basePath !== "/" ? basePath.replace(/\/$/, "") : "";
-	const relativePath =
-		normalizedBasePath && pathname.startsWith(normalizedBasePath)
-			? pathname.slice(normalizedBasePath.length) || "/"
-			: pathname;
-
-	return pluginPaths.some(
-		(p) => pathname.endsWith(p) || relativePath.endsWith(p),
-	);
-}
-
-function resolveRoutePolicy(
-	routePolicy: ERC8128PluginOptions["routePolicy"],
-	request: Request,
-): ResolvedRoutePolicy {
-	if (!routePolicy) {
-		return { requireAuth: false, skipVerification: false };
-	}
-
-	const routeKey = `${request.method.toUpperCase()} ${new URL(request.url).pathname}`;
-	const entries = Object.entries(routePolicy).filter(([key]) => key !== "default");
-
-	const exactMatch = entries.find(([key]) => key === routeKey);
-	const wildcardEntry =
-		exactMatch ??
-		entries.find(([pattern]) => {
-			if (!pattern.includes("*")) {
-				return false;
-			}
-			return wildcardMatch(pattern)(routeKey);
-		});
-
-	if (wildcardEntry) {
-		const [, policy] = wildcardEntry;
-		if (policy === false) {
-			return { requireAuth: false, skipVerification: true };
-		}
-		return { policy, requireAuth: true, skipVerification: false };
-	}
-
-	if (routePolicy.default) {
-		return {
-			policy: routePolicy.default,
-			requireAuth: true,
-			skipVerification: false,
-		};
-	}
-
-	return { requireAuth: false, skipVerification: false };
-}
+	.optional()
+	.refine((data) => !data || !(data.notBefore && data.signature), {
+		message: "Provide either notBefore or signature, not both",
+	});
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
-	/**
-	 * Replayable signature verification cache (same operational model as cookieCache):
-	 * - in-memory and per-process only (not shared across instances)
-	 * - bounded by signature natural expiry (maxValiditySec)
-	 * - intentionally simple (no external store/pluggable cache)
-	 */
-	const verificationCache = new Map<string, CacheValue>();
+	const fallbackCacheMap = new Map<string, CacheValue>();
 	const maxCacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
-	let lastCacheSweepMs = 0;
+	let cacheOps: VerificationCacheOps | null = null;
 
-	const sweepExpiredCacheEntries = () => {
-		const nowMs = Date.now();
-		if (nowMs - lastCacheSweepMs < CACHE_SWEEP_INTERVAL_MS) {
-			return;
+	const getCache = (ctx: GenericEndpointContext): VerificationCacheOps => {
+		if (!cacheOps) {
+			const resolved: "secondary-storage" | "database" | "memory" = ctx.context
+				.secondaryStorage
+				? "secondary-storage"
+				: "database";
+			cacheOps = createVerificationCacheOps(
+				resolved,
+				ctx.context.secondaryStorage,
+				ctx.context.internalAdapter,
+				fallbackCacheMap,
+				maxCacheSize,
+			);
 		}
-		lastCacheSweepMs = nowMs;
-		const nowSec = Math.floor(nowMs / 1000);
-		for (const [sig, value] of verificationCache) {
-			if (value.expires < nowSec) {
-				verificationCache.delete(sig);
-			}
-		}
+		return cacheOps;
 	};
 
 	const verifyBodySchema = z
@@ -191,18 +112,16 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 	return {
 		id: "erc8128",
-		schema: mergeSchema(
-			options?.allowReplayable ? schema : walletAddressSchema,
-			options?.schema,
-		) as ERC8128Schema,
+		schema: mergeSchema(schema, options?.schema) as ERC8128Schema,
 		hooks: {
 			before: [
 				{
 					matcher(context: { request?: Request; headers?: Headers }) {
 						if (context.request) {
-						if (isPluginEndpoint(context.request)) {
-							return false;
-						}
+							// Skip the plugin's own endpoints — they handle their own verification
+							if (isPluginEndpoint(context.request)) {
+								return false;
+							}
 
 							const resolvedRoutePolicy = resolveRoutePolicy(
 								options.routePolicy,
@@ -226,30 +145,45 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							return true;
 						}
 
-						return !!(headers.get("signature") && headers.get("signature-input"));
+						return !!(
+							headers.get("signature") && headers.get("signature-input")
+						);
 					},
-					handler: createAuthMiddleware(async (ctx) => {
-						const incomingHeaders = (ctx.request?.headers || ctx.headers) as Headers | undefined;
+					handler: createAuthMiddleware(async (ctx: GenericEndpointContext) => {
+						const incomingHeaders = (ctx.request?.headers || ctx.headers) as
+							| Headers
+							| undefined;
 						if (!incomingHeaders) {
 							return;
 						}
 
-						if (ctx.request && isPluginEndpoint(ctx.request, ctx.context.baseURL)) {
+						if (
+							ctx.request &&
+							isPluginEndpoint(ctx.request, ctx.context.baseURL)
+						) {
 							return;
 						}
 
 						const resolvedRoutePolicy = ctx.request
 							? resolveRoutePolicy(options.routePolicy, ctx.request)
-							: ({ requireAuth: false, skipVerification: false } as const);
+							: ({
+									policy: undefined,
+									requireAuth: false,
+									skipVerification: false,
+								} as const);
 						if (resolvedRoutePolicy.skipVerification) {
 							return;
 						}
 
 						const authHeader = incomingHeaders.get("authorization") || "";
 						const hasSignatureHeaders =
-							!!incomingHeaders.get("signature") && !!incomingHeaders.get("signature-input");
+							!!incomingHeaders.get("signature") &&
+							!!incomingHeaders.get("signature-input");
 
-						if (!authHeader.toLowerCase().startsWith("erc-8128 ") && !hasSignatureHeaders) {
+						if (
+							!authHeader.toLowerCase().startsWith("erc-8128 ") &&
+							!hasSignatureHeaders
+						) {
 							if (!resolvedRoutePolicy.requireAuth) {
 								return;
 							}
@@ -270,35 +204,38 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							);
 						}
 
-						const nonceStore =
-							options.nonceStore ??
-							createAdapterNonceStore(ctx.context.internalAdapter);
-
 						const verifier = createVerifierClient({
 							verifyMessage: options.verifyMessage,
-							nonceStore,
+							nonceStore: createAdapterNonceStore(ctx.context.internalAdapter),
 							defaults: {
 								...options.defaultPolicy,
 								maxValiditySec: options.maxValiditySec ?? 300,
 								clockSkewSec: options.clockSkewSec ?? 30,
-							maxSignatureVerifications: 1,
-							replayable:
+								maxSignatureVerifications: 1,
+								replayable:
 									options.defaultPolicy?.replayable ??
 									options.allowReplayable ??
 									false,
 								...(options.allowReplayable
 									? {
 											replayableNotBefore: async (keyid: string) => {
-												const record = await ctx.context.adapter.findOne<{
+												const records = await ctx.context.adapter.findMany<{
+													signature?: string;
 													notBefore: number;
 												}>({
 													model: "erc8128Invalidation",
 													where: [
-														{ field: "keyId", operator: "eq", value: keyid.toLowerCase() },
+														{
+															field: "keyId",
+															operator: "eq",
+															value: keyid.toLowerCase(),
+														},
 													],
 												});
-												console.log("[erc8128] replayableNotBefore lookup:", { keyid: keyid.toLowerCase(), notBefore: record?.notBefore ?? null });
-												return record?.notBefore ?? null;
+												const keyRecord = records.find(
+													(r: { signature?: string }) => !r.signature,
+												);
+												return keyRecord?.notBefore ?? null;
 											},
 										}
 									: {}),
@@ -314,24 +251,42 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 						// Check replayable signature cache before full verification
 						let result: VerifyResult | null = null;
+						const cache = getCache(ctx);
 						if (
 							signature &&
 							options.allowReplayable &&
 							!resolvedRoutePolicy.policy
 						) {
-							sweepExpiredCacheEntries();
-							const cached = verificationCache.get(signature);
-							if (cached && cached.expires > Math.floor(Date.now() / 1000)) {
-								const notBeforeRecord = await ctx.context.adapter.findOne<{
-									notBefore: number;
-								}>({
-									model: "erc8128Invalidation",
-									where: [
-										{ field: "keyId", operator: "eq", value: cached.keyId.toLowerCase() },
-									],
-								});
+							cache.sweep();
 
-								if (
+							const cached = await cache.get(signature);
+							if (cached && cached.expires > Math.floor(Date.now() / 1000)) {
+								// Single query returns both per-keyId notBefore and per-signature invalidation records
+								type InvalidationRecord = {
+									signature?: string;
+									notBefore: number;
+								};
+								const invalidations =
+									await ctx.context.adapter.findMany<InvalidationRecord>({
+										model: "erc8128Invalidation",
+										where: [
+											{
+												field: "keyId",
+												operator: "eq",
+												value: cached.keyId.toLowerCase(),
+											},
+										],
+									});
+								const notBeforeRecord = invalidations.find(
+									(r: InvalidationRecord) => !r.signature,
+								);
+								const invalidatedRecord = invalidations.find(
+									(r: InvalidationRecord) => r.signature === signature,
+								);
+
+								if (invalidatedRecord) {
+									await cache.delete(signature);
+								} else if (
 									!notBeforeRecord ||
 									cached.created > notBeforeRecord.notBefore
 								) {
@@ -361,8 +316,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								JSON.stringify({
 									error: "erc8128_verification_failed",
 									reason: "missing_request_context",
-									detail:
-										"Unable to verify signature without request context",
+									detail: "Unable to verify signature without request context",
 								}),
 								{
 									status: 401,
@@ -375,13 +329,53 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							);
 						}
 
-						result ??= await verifier.verifyRequest({
-							request: ctx.request,
-							policy: resolvedRoutePolicy.policy,
-							setHeaders: (name, value) => {
-								responseHeaders[name] = value;
-							},
-						});
+						if (!result) {
+							// Start invalidation check in parallel with verification (fail early if invalidated)
+							const invalidationPromise = signature
+								? ctx.context.adapter.findOne({
+										model: "erc8128Invalidation",
+										where: [
+											{
+												field: "signature",
+												operator: "eq",
+												value: signature,
+											},
+										],
+									})
+								: Promise.resolve(null);
+
+							const verificationPromise = verifier.verifyRequest({
+								request: ctx.request,
+								policy: resolvedRoutePolicy.policy,
+								setHeaders: (name, value) => {
+									responseHeaders[name] = value;
+								},
+							});
+
+							const invalidatedRecord = await invalidationPromise;
+							if (invalidatedRecord) {
+								await cache.delete(signature!);
+								if (!resolvedRoutePolicy.requireAuth) {
+									return;
+								}
+								return new Response(
+									JSON.stringify({
+										error: "erc8128_verification_failed",
+										reason: "signature_invalidated",
+										detail: "Signature has been explicitly invalidated",
+									}),
+									{
+										status: 401,
+										headers: {
+											"Content-Type": "application/json",
+											...responseHeaders,
+										},
+									},
+								);
+							}
+
+							result = await verificationPromise;
+						}
 						if (!result.ok) {
 							if (!resolvedRoutePolicy.requireAuth) {
 								return;
@@ -403,7 +397,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						}
 
 						if (options.allowReplayable) {
-							const notBeforeRecord = await ctx.context.adapter.findOne<{
+							const records = await ctx.context.adapter.findMany<{
+								signature?: string;
 								notBefore: number;
 							}>({
 								model: "erc8128Invalidation",
@@ -415,6 +410,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									},
 								],
 							});
+							const notBeforeRecord = records.find(
+								(r: { signature?: string }) => !r.signature,
+							);
 							if (
 								notBeforeRecord &&
 								result.params.created < notBeforeRecord.notBefore
@@ -439,22 +437,22 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							}
 						}
 
-
-						// Cache replayable verification result (LRU eviction)
+						// Cache replayable verification result
 						if (signature && result.replayable && options.allowReplayable) {
-							if (verificationCache.has(signature)) {
-								verificationCache.delete(signature);
-							}
-							verificationCache.set(signature, {
-								address: result.address,
-								chainId: result.chainId,
-								keyId: result.params.keyid.toLowerCase(),
-								expires: result.params.expires,
-								created: result.params.created,
-							});
-							if (verificationCache.size > maxCacheSize) {
-								const oldest = verificationCache.keys().next().value;
-								if (oldest) verificationCache.delete(oldest);
+							const ttlSec =
+								result.params.expires - Math.floor(Date.now() / 1000);
+							if (ttlSec > 0) {
+								await cache.set(
+									signature,
+									{
+										address: result.address,
+										chainId: result.chainId,
+										keyId: result.params.keyid.toLowerCase(),
+										expires: result.params.expires,
+										created: result.params.created,
+									},
+									ttlSec,
+								);
 							}
 						}
 
@@ -468,6 +466,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							],
 						});
 
+						// No known wallet or session creation disabled — stop after verification
 						if (!found || options.createSession === false) {
 							return;
 						}
@@ -547,14 +546,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					requireRequest: true,
 				},
 				async (ctx) => {
-					const nonceStore =
-						options.nonceStore ??
-						createAdapterNonceStore(ctx.context.internalAdapter);
 					// Verify endpoint requires request-bound, non-replayable signatures
 					// (replayable/class-bound flexibility is for the middleware only)
 					const verifier = createVerifierClient({
 						verifyMessage: options.verifyMessage,
-						nonceStore,
+						nonceStore: createAdapterNonceStore(ctx.context.internalAdapter),
 						defaults: {
 							maxValiditySec: options.maxValiditySec ?? 300,
 							clockSkewSec: options.clockSkewSec ?? 30,
@@ -571,10 +567,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					const verificationRequest =
 						hasBodyMethod && ctx.body !== undefined
 							? new Request(sourceRequest.url, {
-								method: sourceRequest.method,
-								headers: sourceRequest.headers,
-								body: JSON.stringify(ctx.body),
-							})
+									method: sourceRequest.method,
+									headers: sourceRequest.headers,
+									body: JSON.stringify(ctx.body),
+								})
 							: sourceRequest;
 
 					const result = await verifier.verifyRequest({
@@ -692,7 +688,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								userId: user.id,
 								address: walletAddress,
 								chainId,
-								isPrimary: true,
+								isPrimary: true, // First address is primary
 								createdAt: new Date(),
 							},
 						});
@@ -706,14 +702,14 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							updatedAt: new Date(),
 						});
 					} else if (!existingWalletAddress) {
-						// User exists, add this new chainId to existing user's addresses
+						// User exists on another chain — add this new chainId
 						await ctx.context.adapter.create({
 							model: "walletAddress",
 							data: {
 								userId: user.id,
 								address: walletAddress,
 								chainId,
-								isPrimary: false,
+								isPrimary: false, // Additional addresses are not primary by default
 								createdAt: new Date(),
 							},
 						});
@@ -774,12 +770,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								requireRequest: true,
 							},
 							async (ctx) => {
-								const nonceStore =
-									options.nonceStore ??
-									createAdapterNonceStore(ctx.context.internalAdapter);
 								const verifier = createVerifierClient({
 									verifyMessage: options.verifyMessage,
-									nonceStore,
+									nonceStore: createAdapterNonceStore(
+										ctx.context.internalAdapter,
+									),
 									defaults: {
 										...options.defaultPolicy,
 										replayable: false,
@@ -792,19 +787,22 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 								const sourceRequest = ctx.request!;
 								const hasBodyMethod =
-									sourceRequest.method !== "GET" && sourceRequest.method !== "HEAD";
+									sourceRequest.method !== "GET" &&
+									sourceRequest.method !== "HEAD";
 								const verificationRequest = hasBodyMethod
 									? (() => {
-										const headers = new Headers(sourceRequest.headers);
-										headers.delete("content-length");
-										const body =
-											ctx.body === undefined ? undefined : JSON.stringify(ctx.body);
-										return new Request(sourceRequest.url, {
-											method: sourceRequest.method,
-											headers,
-											body,
-										});
-									})()
+											const headers = new Headers(sourceRequest.headers);
+											headers.delete("content-length");
+											const body =
+												ctx.body === undefined
+													? undefined
+													: JSON.stringify(ctx.body);
+											return new Request(sourceRequest.url, {
+												method: sourceRequest.method,
+												headers,
+												body,
+											});
+										})()
 									: sourceRequest;
 
 								const result = await verifier.verifyRequest({
@@ -830,12 +828,66 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									);
 								}
 
-								const notBefore =
-									ctx.body?.notBefore ?? (Math.floor(Date.now() / 1000) + 1);
+								// Per-signature invalidation
+								if (ctx.body?.signature) {
+									const sigToInvalidate = ctx.body.signature;
+									const maxValidity = options.maxValiditySec ?? 300;
+									const expiresAt = Math.floor(Date.now() / 1000) + maxValidity;
 
-								// Upsert invalidation record
-								const existing = await ctx.context.adapter.findOne<{
+									const existing = await ctx.context.adapter.findOne<{
+										id: string;
+									}>({
+										model: "erc8128Invalidation",
+										where: [
+											{
+												field: "signature",
+												operator: "eq",
+												value: sigToInvalidate,
+											},
+										],
+									});
+									if (!existing) {
+										await ctx.context.adapter.create({
+											model: "erc8128Invalidation",
+											data: {
+												signature: sigToInvalidate,
+												keyId: result.params.keyid.toLowerCase(),
+												notBefore: 0,
+												expiresAt,
+												updatedAt: new Date(),
+											},
+										});
+									} else {
+										await ctx.context.adapter.update({
+											model: "erc8128Invalidation",
+											where: [
+												{
+													field: "id",
+													operator: "eq",
+													value: existing.id,
+												},
+											],
+											update: { expiresAt },
+										});
+									}
+
+									const sigCache = getCache(ctx);
+									await sigCache.delete(sigToInvalidate);
+
+									return ctx.json({
+										success: true,
+										invalidatedSignature: sigToInvalidate,
+									});
+								}
+
+								// Per-keyId invalidation (default to now+1 so signatures created this second are invalidated)
+								const notBefore =
+									ctx.body?.notBefore ?? Math.floor(Date.now() / 1000) + 1;
+
+								// Upsert per-keyId invalidation record
+								const keyRecords = await ctx.context.adapter.findMany<{
 									id: string;
+									signature?: string;
 								}>({
 									model: "erc8128Invalidation",
 									where: [
@@ -846,6 +898,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 										},
 									],
 								});
+								const existing = keyRecords.find(
+									(r: { signature?: string }) => !r.signature,
+								);
 
 								if (!existing) {
 									await ctx.context.adapter.create({
@@ -874,14 +929,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								}
 
 								// Evict cached entries that are now invalidated
-								for (const [sig, value] of verificationCache) {
-									if (
-										value.keyId.toLowerCase() === result.params.keyid.toLowerCase() &&
-										value.created <= notBefore
-									) {
-										verificationCache.delete(sig);
-									}
-								}
+								const keyIdCache = getCache(ctx);
+								keyIdCache.evictByKeyId(
+									result.params.keyid.toLowerCase(),
+									notBefore,
+								);
 
 								return ctx.json({
 									success: true,

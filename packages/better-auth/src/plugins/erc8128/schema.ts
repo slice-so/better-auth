@@ -38,11 +38,21 @@ export const invalidationSchema = {
 			keyId: {
 				type: "string",
 				required: true,
-				unique: true,
+				index: true,
+			},
+			/** Per-signature invalidation: the signature hex. Empty for per-keyId notBefore rows. */
+			signature: {
+				type: "string",
+				defaultValue: "",
+				index: true,
 			},
 			notBefore: {
 				type: "number",
 				required: true,
+			},
+			expiresAt: {
+				type: "number",
+				defaultValue: 0,
 			},
 			updatedAt: {
 				type: "date",

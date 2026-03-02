@@ -3,22 +3,9 @@ title: ERC-8128
 description: Authenticate requests with Ethereum wallets using HTTP Message Signatures
 ---
 
-The ERC-8128 plugin adds [ERC-8128](https://erc8128.org) authentication to Better Auth — cryptographic request signing with Ethereum wallets, built on [HTTP Message Signatures (RFC 9421)](https://www.rfc-editor.org/rfc/rfc9421).
+The ERC-8128 plugin adds [ERC-8128](https://erc8128.org) authentication to Better Auth — cryptographic request signing with Ethereum wallets, built on [HTTP Message Signatures (RFC 9421)](https://www.rfc-editor.org/rfc/rfc9421). Each signature binds to the HTTP method, path, headers, and body, giving you request integrity, replay protection, and an optional fully stateless flow.
 
-## Why ERC-8128?
-
-Session-based wallet authentication (sign a challenge, get a cookie) protects the login step but not what follows. Every subsequent request travels with a bearer token that can be stolen, replayed, or misrouted — the server trusts the token, not the request.
-
-ERC-8128 signs **every request** individually. The signature binds to the HTTP method, path, headers, and body, so any tampering breaks verification. This gives you:
-
-- **Request integrity** — each call is independently authenticated and tamper-evident.
-- **No bearer credentials** — nothing to leak, rotate, or revoke.
-- **Replay protection** — built-in nonces prevent captured requests from being reused.
-- **Stateless option** — works without sessions, cookies, or server-side state.
-
-This makes ERC-8128 the natural authentication layer for **autonomous agents and machine-to-machine calls**. An agent with an Ethereum key can authenticate with any ERC-8128-enabled endpoint — no API key provisioning, no OAuth flows, no manual setup. Enabling ERC-8128 on your server makes it instantly accessible to the entire ecosystem of onchain agents.
-
-The plugin supports both modes: use it as a **session-based sign-in** (sign once via `/erc8128/verify`, get a cookie, use sessions normally) or as **per-request authentication** where every call is individually signed.
+The plugin supports two modes: **session-based sign-in** (sign once via `/erc8128/verify`, get a cookie, use sessions normally) and **per-request authentication** where every call is individually signed — ideal for autonomous agents and machine-to-machine calls.
 
 ## Installation
 
@@ -217,19 +204,38 @@ When verification is required and fails, the response includes:
 
 Along with `Accept-Signature` and `WWW-Authenticate` headers indicating the expected signature components.
 
+## Caching & Storage
+
+The plugin uses three different storage mechanisms, each with different durability requirements:
+
+| Concern | Storage | Why |
+| --- | --- | --- |
+| **Nonce / replay protection** | Database (`verification` table) | Security-critical. A lost nonce could allow a replay attack. |
+| **Signature invalidation** | Database (`erc8128Invalidation` table) | Security-critical. Losing state would re-enable revoked signatures. |
+| **Verification cache** | `secondaryStorage` if configured, otherwise database, with in-memory L1 | Performance optimization only. A cache miss triggers a full re-verification — no security impact. |
+
+### Verification cache
+
+When `allowReplayable` is enabled, the plugin caches the result of successful replayable signature verifications so that subsequent requests carrying the same signature can skip the expensive cryptographic re-verification (which may involve on-chain RPC calls for ERC-1271 smart contract wallets).
+
+If Better Auth's `secondaryStorage` is configured (e.g. Redis), the cache uses it automatically — entries are stored with a TTL matching the signature's remaining validity, shared across all instances. Otherwise, the cache falls back to the database (`verification` table) with a per-process in-memory read-through Map.
+
+<Callout>
+ERC-8128 involves cryptographic signature verification on every request. For production deployments, configure Better Auth's `secondaryStorage` (e.g. Redis) so the verification cache is shared across all server instances and survives restarts.
+</Callout>
+
 ## Options
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `verifyMessage` | `VerifyMessageFn` | *required* | Signature verification function (use viem's `verifyMessage`). |
-| `nonceStore` | `NonceStore` | DB-backed | Custom nonce storage (e.g. Redis) for replay protection. |
 | `defaultPolicy` | `VerifyPolicy` | — | Default verification policy for middleware. |
 | `createSession` | `boolean` | `true` | Create a Better Auth session on `/erc8128/verify`. |
 | `sessionExpiresIn` | `number` | — | Session TTL in seconds. |
 | `allowReplayable` | `boolean` | `false` | Enable replayable signatures and `/erc8128/invalidate`. |
 | `maxValiditySec` | `number` | `300` | Maximum signature validity window (seconds). |
 | `clockSkewSec` | `number` | `30` | Allowed clock skew (seconds). |
-| `cacheSize` | `number` | `10000` | In-memory cache size for replayable verification results. |
+| `cacheSize` | `number` | `10000` | Max entries in the in-memory verification cache. Ignored when `secondaryStorage` is active. |
 | `routePolicy` | `Record<string, VerifyPolicy \| false>` | — | Per-route middleware policy map. Keys are `"METHOD /path"` patterns. |
 | `emailDomainName` | `string` | From `baseURL` | Domain for auto-generated user emails. |
 | `anonymous` | `boolean` | `true` | If `false`, email is required on verify. |
@@ -242,28 +248,6 @@ Along with `Accept-Signature` and `WWW-Authenticate` headers indicating the expe
 | `POST` | `/erc8128/verify` | Verify a signed request, create/link user, start session. |
 | `POST` | `/erc8128/invalidate` | Invalidate replayable signatures (requires `allowReplayable`). |
 | `GET` | `/.well-known/erc8128` | Discovery metadata (algorithms, policies, endpoints). |
-
-## Custom Nonce Store
-
-The default nonce store uses Better Auth's database adapter. For distributed deployments, provide a Redis-backed store:
-
-```ts title="auth.ts"
-import Redis from "ioredis";
-
-const redis = new Redis(process.env.REDIS_URL!);
-
-erc8128({
-  verifyMessage,
-  nonceStore: {
-    async putNonce(key: string, ttlSec: number) {
-      await redis.set(`nonce:${key}`, "1", "EX", ttlSec, "NX");
-    },
-    async consumeNonce(key: string) {
-      return (await redis.del(`nonce:${key}`)) > 0;
-    },
-  },
-});
-```
 
 ## Schema
 
@@ -279,10 +263,12 @@ erc8128({
 
 ### `erc8128Invalidation`
 
-Only created when `allowReplayable: true`.
+Stores both per-keyId invalidation timestamps and per-signature invalidation records.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `keyId` | `string` | ERC-8128 key ID (`erc8128:<chainId>:<address>`). |
-| `notBefore` | `number` | Unix timestamp — signatures created before this are rejected. |
+| `signature` | `string` | Signature hex for per-signature invalidation. Empty for per-keyId `notBefore` rows. |
+| `notBefore` | `number` | Unix timestamp — signatures created before this are rejected. `0` for per-signature rows. |
+| `expiresAt` | `number` | Unix timestamp when this invalidation record can be cleaned up. `0` for per-keyId rows. |
 | `updatedAt` | `date` | Last update timestamp. |
