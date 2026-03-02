@@ -3,7 +3,22 @@ title: ERC-8128
 description: Authenticate requests with Ethereum wallets using HTTP Message Signatures
 ---
 
-The ERC-8128 plugin adds [ERC-8128](https://erc8128.org) authentication to Better Auth — an Ethereum-native signature-based authentication flow based on HTTP Message Signatures and the ERC-8128 specification. It supports both session-based sign-in and stateless per-request authentication.
+The ERC-8128 plugin adds [ERC-8128](https://erc8128.org) authentication to Better Auth — cryptographic request signing with Ethereum wallets, built on [HTTP Message Signatures (RFC 9421)](https://www.rfc-editor.org/rfc/rfc9421).
+
+## Why ERC-8128?
+
+Session-based wallet authentication (sign a challenge, get a cookie) protects the login step but not what follows. Every subsequent request travels with a bearer token that can be stolen, replayed, or misrouted — the server trusts the token, not the request.
+
+ERC-8128 signs **every request** individually. The signature binds to the HTTP method, path, headers, and body, so any tampering breaks verification. This gives you:
+
+- **Request integrity** — each call is independently authenticated and tamper-evident.
+- **No bearer credentials** — nothing to leak, rotate, or revoke.
+- **Replay protection** — built-in nonces prevent captured requests from being reused.
+- **Stateless option** — works without sessions, cookies, or server-side state.
+
+This makes ERC-8128 the natural authentication layer for **autonomous agents and machine-to-machine calls**. An agent with an Ethereum key can authenticate with any ERC-8128-enabled endpoint — no API key provisioning, no OAuth flows, no manual setup. Enabling ERC-8128 on your server makes it instantly accessible to the entire ecosystem of onchain agents.
+
+The plugin supports both modes: use it as a **session-based sign-in** (sign once via `/erc8128/verify`, get a cookie, use sessions normally) or as **per-request authentication** where every call is individually signed.
 
 ## Installation
 
