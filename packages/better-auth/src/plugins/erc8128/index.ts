@@ -44,7 +44,18 @@ import {
 	DEFAULT_CACHE_SIZE,
 } from "./verification-cache";
 
+/**
+ * Fallback for invalidation TTL sizing when the user doesn't set `maxValiditySec`.
+ * Must match the library's internal default (300s) so invalidation records
+ * outlive the signatures they could invalidate.
+ */
 const DEFAULT_MAX_VALIDITY_SEC = 300;
+/** Clock skew tolerance for server-side signature verification. */
+const DEFAULT_CLOCK_SKEW_SEC = 30;
+/** Only verify one signature per request (the first valid one). */
+const MAX_SIGNATURE_VERIFICATIONS = 1;
+/** Minimum TTL floor for invalidation records (30 days). */
+export const DEFAULT_INVALIDATION_TTL_SEC = 30 * 24 * 60 * 60;
 
 declare module "@better-auth/core" {
 	interface BetterAuthPluginRegistry<AuthOptions, Options> {
@@ -140,7 +151,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				const maxTtl = options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC;
 				// Default TTL for invalidation records: generous upper bound
 				// so records outlive any signature they could invalidate
-				const invalidationTtl = Math.max(maxTtl * 2, 30 * 24 * 60 * 60);
+				const invalidationTtl = Math.max(
+					maxTtl * 2,
+					DEFAULT_INVALIDATION_TTL_SEC,
+				);
 				const ssOps = createSecondaryStorageInvalidationOps(
 					ctx.context.secondaryStorage,
 					invalidationTtl,
@@ -393,8 +407,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							defaults: {
 								...options.defaultPolicy,
 								maxValiditySec: options.maxValiditySec,
-								clockSkewSec: options.clockSkewSec ?? 30,
-								maxSignatureVerifications: 1,
+								clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
+								maxSignatureVerifications: MAX_SIGNATURE_VERIFICATIONS,
 								replayable: options.defaultPolicy?.replayable ?? false,
 								...(replayableEnabled
 									? {
@@ -606,8 +620,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							invalidationEndpoint: replayableEnabled
 								? `${baseURL}/erc8128/invalidate`
 								: undefined,
-							maxValiditySec:
-								options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC,
+							maxValiditySec: options.maxValiditySec,
 							routePolicy: options.routePolicy,
 						}),
 					);
@@ -628,8 +641,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						nonceStore: getNonceStore(ctx),
 						defaults: {
 							maxValiditySec: options.maxValiditySec,
-							clockSkewSec: options.clockSkewSec ?? 30,
-							maxSignatureVerifications: 1,
+							clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
+							maxSignatureVerifications: MAX_SIGNATURE_VERIFICATIONS,
 							replayable: false,
 						},
 					});
@@ -742,8 +755,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									nonceStore: getNonceStore(ctx),
 									defaults: {
 										maxValiditySec: options.maxValiditySec,
-										clockSkewSec: options.clockSkewSec ?? 30,
-										maxSignatureVerifications: 1,
+										clockSkewSec:
+											options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
+										maxSignatureVerifications: MAX_SIGNATURE_VERIFICATIONS,
 										replayable: false,
 									},
 								});

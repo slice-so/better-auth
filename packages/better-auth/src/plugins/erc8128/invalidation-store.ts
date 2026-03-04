@@ -1,5 +1,6 @@
 import type { SecondaryStorage } from "@better-auth/core/db";
 import type { Where } from "@better-auth/core/db/adapter";
+import { DEFAULT_INVALIDATION_TTL_SEC } from ".";
 
 const INV_KEY_PREFIX = "erc8128:inv:keyid:";
 const INV_SIG_PREFIX = "erc8128:inv:sig:";
@@ -165,7 +166,7 @@ export function createDBInvalidationOps(
  */
 export function createSecondaryStorageInvalidationOps(
 	storage: SecondaryStorage,
-	defaultTtlSec: number = 30 * 24 * 60 * 60, // 30 days default
+	defaultTtlSec: number = DEFAULT_INVALIDATION_TTL_SEC,
 ): InvalidationOps {
 	return {
 		async findByKeyId(keyId: string): Promise<InvalidationRecord[]> {

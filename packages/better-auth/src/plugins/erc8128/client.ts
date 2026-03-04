@@ -96,6 +96,8 @@ export interface Erc8128ClientOptions
 // ---------------------------------------------------------------------------
 
 const SKIP_PATHS = ["/.well-known/erc8128"];
+/** Seconds before actual expiry to consider a cached signature stale. */
+const DEFAULT_EXPIRY_MARGIN_SEC = 10;
 
 function parseExpiresFromSignatureInput(signatureInput: string): number | null {
 	const match = signatureInput.match(/expires=(\d+)/);
@@ -203,7 +205,7 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 	} = options;
 
 	const store = resolveStore(options);
-	const margin = expiryMarginSec ?? 10;
+	const margin = expiryMarginSec ?? DEFAULT_EXPIRY_MARGIN_SEC;
 
 	let serverConfig: ServerConfig | null = null;
 	let signerClient: SignerClient | null = null;
