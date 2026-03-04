@@ -19,7 +19,16 @@ import { mergeSchema } from "../../db/schema";
 import type { InferOptionSchema, User } from "../../types";
 import { HIDE_METADATA } from "../../utils/hide-metadata";
 import { getOrigin } from "../../utils/url";
-import { createAdapterNonceStore } from "./nonce-store";
+import type { InvalidationOps } from "./invalidation-store";
+import {
+	createDBInvalidationOps,
+	createDualInvalidationOps,
+	createSecondaryStorageInvalidationOps,
+} from "./invalidation-store";
+import {
+	createAdapterNonceStore,
+	createSecondaryStorageNonceStore,
+} from "./nonce-store";
 import { isPluginEndpoint, resolveRoutePolicy } from "./route-policy";
 import type { ERC8128Schema } from "./schema";
 import { schema } from "./schema";
@@ -62,6 +71,20 @@ export interface ERC8128PluginOptions {
 				default?: VerifyPolicy;
 		  })
 		| undefined;
+	/**
+	 * When `secondaryStorage` is configured, nonces and invalidation records
+	 * are stored there by default (with TTL-based auto-cleanup). Set this to
+	 * `true` to also persist them to the database, using secondaryStorage as a
+	 * fast read-through layer.
+	 *
+	 * Follows the same pattern as Better Auth's `session.storeSessionInDatabase`.
+	 *
+	 * Has no effect when `secondaryStorage` is not configured (everything uses
+	 * the database).
+	 *
+	 * @default false
+	 */
+	storeInDatabase?: boolean | undefined;
 }
 
 const invalidateBodySchema = z
@@ -85,6 +108,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 	const fallbackCacheMap = new Map<string, CacheValue>();
 	const maxCacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
 	let cacheOps: VerificationCacheOps | null = null;
+	let invalidationOpsInstance: InvalidationOps | null = null;
 
 	const getCache = (ctx: GenericEndpointContext): VerificationCacheOps => {
 		if (!cacheOps) {
@@ -101,6 +125,35 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			);
 		}
 		return cacheOps;
+	};
+
+	const getInvalidationOps = (ctx: GenericEndpointContext): InvalidationOps => {
+		if (!invalidationOpsInstance) {
+			const dbOps = createDBInvalidationOps(ctx.context.adapter);
+			if (ctx.context.secondaryStorage) {
+				const maxTtl = options.maxValiditySec ?? 300;
+				// Default TTL for invalidation records: generous upper bound
+				// so records outlive any signature they could invalidate
+				const invalidationTtl = Math.max(maxTtl * 2, 30 * 24 * 60 * 60);
+				const ssOps = createSecondaryStorageInvalidationOps(
+					ctx.context.secondaryStorage,
+					invalidationTtl,
+				);
+				invalidationOpsInstance = options.storeInDatabase
+					? createDualInvalidationOps(dbOps, ssOps)
+					: ssOps;
+			} else {
+				invalidationOpsInstance = dbOps;
+			}
+		}
+		return invalidationOpsInstance;
+	};
+
+	const getNonceStore = (ctx: GenericEndpointContext) => {
+		if (ctx.context.secondaryStorage && !options.storeInDatabase) {
+			return createSecondaryStorageNonceStore(ctx.context.secondaryStorage);
+		}
+		return createAdapterNonceStore(ctx.context.internalAdapter);
 	};
 
 	const findOrCreateWalletUser = async (
@@ -321,7 +374,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 						const verifier = createVerifierClient({
 							verifyMessage: options.verifyMessage,
-							nonceStore: createAdapterNonceStore(ctx.context.internalAdapter),
+							nonceStore: getNonceStore(ctx),
 							defaults: {
 								...options.defaultPolicy,
 								maxValiditySec: options.maxValiditySec ?? 300,
@@ -331,21 +384,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								...(replayableEnabled
 									? {
 											replayableNotBefore: async (keyid: string) => {
-												const records = await ctx.context.adapter.findMany<{
-													signature?: string;
-													notBefore: number;
-												}>({
-													model: "erc8128Invalidation",
-													where: [
-														{
-															field: "keyId",
-															operator: "eq",
-															value: keyid.toLowerCase(),
-														},
-													],
-												});
+												const inv = getInvalidationOps(ctx);
+												const records = await inv.findByKeyId(keyid);
 												const keyRecord = records.find(
-													(r: { signature?: string }) => !r.signature,
+													(r) => !r.signature,
 												);
 												return keyRecord?.notBefore ?? null;
 											},
@@ -370,26 +412,13 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							const cached = await cache.get(signature);
 							if (cached && cached.expires > Math.floor(Date.now() / 1000)) {
 								// Single query returns both per-keyId notBefore and per-signature invalidation records
-								type InvalidationRecord = {
-									signature?: string;
-									notBefore: number;
-								};
-								const invalidations =
-									await ctx.context.adapter.findMany<InvalidationRecord>({
-										model: "erc8128Invalidation",
-										where: [
-											{
-												field: "keyId",
-												operator: "eq",
-												value: cached.keyId.toLowerCase(),
-											},
-										],
-									});
-								const notBeforeRecord = invalidations.find(
-									(r: InvalidationRecord) => !r.signature,
-								);
-								const invalidatedRecord = invalidations.find(
-									(r: InvalidationRecord) => r.signature === signature,
+								const inv = getInvalidationOps(ctx);
+								const [keyIdRecords, invalidatedRecord] = await Promise.all([
+									inv.findByKeyId(cached.keyId),
+									inv.findBySignature(signature),
+								]);
+								const notBeforeRecord = keyIdRecords.find(
+									(r) => !r.signature,
 								);
 
 								if (invalidatedRecord) {
@@ -439,17 +468,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 						if (!result) {
 							// Start invalidation check in parallel with verification (fail early if invalidated)
+							const inv = getInvalidationOps(ctx);
 							const invalidationPromise = signature
-								? ctx.context.adapter.findOne({
-										model: "erc8128Invalidation",
-										where: [
-											{
-												field: "signature",
-												operator: "eq",
-												value: signature,
-											},
-										],
-									})
+								? inv.findBySignature(signature)
 								: Promise.resolve(null);
 
 							const verificationPromise = verifier.verifyRequest({
@@ -505,21 +526,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						}
 
 						if (replayableEnabled) {
-							const records = await ctx.context.adapter.findMany<{
-								signature?: string;
-								notBefore: number;
-							}>({
-								model: "erc8128Invalidation",
-								where: [
-									{
-										field: "keyId",
-										operator: "eq",
-										value: result.params.keyid.toLowerCase(),
-									},
-								],
-							});
+							const invOps = getInvalidationOps(ctx);
+							const records = await invOps.findByKeyId(result.params.keyid);
 							const notBeforeRecord = records.find(
-								(r: { signature?: string }) => !r.signature,
+								(r) => !r.signature,
 							);
 							if (
 								notBeforeRecord &&
@@ -619,7 +629,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					// (replayable/class-bound flexibility is for the middleware only)
 					const verifier = createVerifierClient({
 						verifyMessage: options.verifyMessage,
-						nonceStore: createAdapterNonceStore(ctx.context.internalAdapter),
+						nonceStore: getNonceStore(ctx),
 						defaults: {
 							maxValiditySec: options.maxValiditySec ?? 300,
 							clockSkewSec: options.clockSkewSec ?? 30,
@@ -733,9 +743,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							async (ctx) => {
 								const verifier = createVerifierClient({
 									verifyMessage: options.verifyMessage,
-									nonceStore: createAdapterNonceStore(
-										ctx.context.internalAdapter,
-									),
+									nonceStore: getNonceStore(ctx),
 									defaults: {
 										maxValiditySec: options.maxValiditySec ?? 300,
 										clockSkewSec: options.clockSkewSec ?? 30,
@@ -789,48 +797,17 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									);
 								}
 
+								const invOps = getInvalidationOps(ctx);
+								const maxValidity = options.maxValiditySec ?? 300;
+
 								// Per-signature invalidation
 								if (ctx.body?.signature) {
 									const sigToInvalidate = ctx.body.signature;
-									const maxValidity = options.maxValiditySec ?? 300;
-									const expiresAt = Math.floor(Date.now() / 1000) + maxValidity;
-
-									const existing = await ctx.context.adapter.findOne<{
-										id: string;
-									}>({
-										model: "erc8128Invalidation",
-										where: [
-											{
-												field: "signature",
-												operator: "eq",
-												value: sigToInvalidate,
-											},
-										],
-									});
-									if (!existing) {
-										await ctx.context.adapter.create({
-											model: "erc8128Invalidation",
-											data: {
-												signature: sigToInvalidate,
-												keyId: result.params.keyid.toLowerCase(),
-												notBefore: 0,
-												expiresAt,
-												updatedAt: new Date(),
-											},
-										});
-									} else {
-										await ctx.context.adapter.update({
-											model: "erc8128Invalidation",
-											where: [
-												{
-													field: "id",
-													operator: "eq",
-													value: existing.id,
-												},
-											],
-											update: { expiresAt },
-										});
-									}
+									await invOps.upsertSignatureInvalidation(
+										result.params.keyid,
+										sigToInvalidate,
+										maxValidity,
+									);
 
 									const sigCache = getCache(ctx);
 									await sigCache.delete(sigToInvalidate);
@@ -845,49 +822,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								const notBefore =
 									ctx.body?.notBefore ?? Math.floor(Date.now() / 1000) + 1;
 
-								// Upsert per-keyId invalidation record
-								const keyRecords = await ctx.context.adapter.findMany<{
-									id: string;
-									signature?: string;
-								}>({
-									model: "erc8128Invalidation",
-									where: [
-										{
-											field: "keyId",
-											operator: "eq",
-											value: result.params.keyid.toLowerCase(),
-										},
-									],
-								});
-								const existing = keyRecords.find(
-									(r: { signature?: string }) => !r.signature,
+								await invOps.upsertKeyIdNotBefore(
+									result.params.keyid,
+									notBefore,
 								);
-
-								if (!existing) {
-									await ctx.context.adapter.create({
-										model: "erc8128Invalidation",
-										data: {
-											keyId: result.params.keyid.toLowerCase(),
-											notBefore,
-											updatedAt: new Date(),
-										},
-									});
-								} else {
-									await ctx.context.adapter.update({
-										model: "erc8128Invalidation",
-										where: [
-											{
-												field: "id",
-												operator: "eq",
-												value: existing.id,
-											},
-										],
-										update: {
-											notBefore,
-											updatedAt: new Date(),
-										},
-									});
-								}
 
 								// Evict cached entries that are now invalidated
 								const keyIdCache = getCache(ctx);
