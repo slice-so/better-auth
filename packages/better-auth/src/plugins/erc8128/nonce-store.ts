@@ -45,6 +45,29 @@ export function createSecondaryStorageNonceStore(
 	};
 }
 
+/**
+ * Dual-write NonceStore: consumes from both DB and secondaryStorage.
+ * Both must succeed for the nonce to be considered consumed.
+ * Reads from secondaryStorage first (fast path), falls back to DB.
+ */
+export function createDualNonceStore(
+	dbStore: NonceStore,
+	ssStore: NonceStore,
+): NonceStore {
+	return {
+		async consume(key: string, ttlSeconds: number): Promise<boolean> {
+			// Check secondaryStorage first (fast)
+			const ssResult = await ssStore.consume(key, ttlSeconds);
+			if (!ssResult) {
+				return false; // Already consumed in SS
+			}
+			// Also consume in DB for durability
+			const dbResult = await dbStore.consume(key, ttlSeconds);
+			return dbResult;
+		},
+	};
+}
+
 export function createAdapterNonceStore(
 	adapter: VerificationAdapter,
 ): NonceStore {

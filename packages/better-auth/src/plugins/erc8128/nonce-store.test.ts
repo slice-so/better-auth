@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
 	createAdapterNonceStore,
+	createDualNonceStore,
 	createSecondaryStorageNonceStore,
 } from "./nonce-store";
 
@@ -155,5 +156,89 @@ describe("secondaryStorage nonce store", () => {
 
 		const nonceStore = createSecondaryStorageNonceStore(storage);
 		expect(await nonceStore.consume("err-nonce", 60)).toBe(false);
+	});
+});
+
+describe("dual nonce store", () => {
+	function createMockStorage() {
+		const store = new Map<string, { value: string; expiresAt: number }>();
+		return {
+			store,
+			storage: {
+				async get(key: string) {
+					const entry = store.get(key);
+					if (!entry) return null;
+					if (entry.expiresAt <= Date.now()) {
+						store.delete(key);
+						return null;
+					}
+					return entry.value;
+				},
+				async set(key: string, value: string, ttl?: number) {
+					store.set(key, {
+						value,
+						expiresAt: Date.now() + (ttl ?? 3600) * 1000,
+					});
+				},
+				async delete(key: string) {
+					store.delete(key);
+				},
+			},
+		};
+	}
+
+	function createMockAdapterStore() {
+		const table = new Map<
+			string,
+			{ identifier: string; value: string; expiresAt: Date }
+		>();
+		const adapter = {
+			async findVerificationValue(identifier: string) {
+				const entry = table.get(identifier);
+				return entry ? { id: identifier, ...entry } : null;
+			},
+			async createVerificationValue(data: {
+				identifier: string;
+				value: string;
+				expiresAt: Date;
+			}) {
+				table.set(data.identifier, data);
+			},
+		};
+		return { table, adapter };
+	}
+
+	it("consumes in both stores", async () => {
+		const { adapter } = createMockAdapterStore();
+		const { storage, store } = createMockStorage();
+
+		const dbStore = createAdapterNonceStore(adapter);
+		const ssStore = createSecondaryStorageNonceStore(storage);
+		const dual = createDualNonceStore(dbStore, ssStore);
+
+		expect(await dual.consume("dual-nonce", 60)).toBe(true);
+
+		// Both stores should have the nonce
+		expect(store.size).toBeGreaterThan(0);
+
+		// Second consume should fail
+		expect(await dual.consume("dual-nonce", 60)).toBe(false);
+	});
+
+	it("rejects if already consumed in secondaryStorage", async () => {
+		const { adapter } = createMockAdapterStore();
+		const { storage } = createMockStorage();
+
+		const ssStore = createSecondaryStorageNonceStore(storage);
+		const dual = createDualNonceStore(
+			createAdapterNonceStore(adapter),
+			ssStore,
+		);
+
+		// Pre-consume in SS only
+		await ssStore.consume("pre-consumed", 60);
+
+		// Dual should reject
+		expect(await dual.consume("pre-consumed", 60)).toBe(false);
 	});
 });

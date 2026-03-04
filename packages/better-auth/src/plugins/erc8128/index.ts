@@ -27,6 +27,7 @@ import {
 } from "./invalidation-store";
 import {
 	createAdapterNonceStore,
+	createDualNonceStore,
 	createSecondaryStorageNonceStore,
 } from "./nonce-store";
 import { isPluginEndpoint, resolveRoutePolicy } from "./route-policy";
@@ -150,8 +151,17 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 	};
 
 	const getNonceStore = (ctx: GenericEndpointContext) => {
-		if (ctx.context.secondaryStorage && !options.storeInDatabase) {
-			return createSecondaryStorageNonceStore(ctx.context.secondaryStorage);
+		if (ctx.context.secondaryStorage) {
+			const ssStore = createSecondaryStorageNonceStore(
+				ctx.context.secondaryStorage,
+			);
+			if (options.storeInDatabase) {
+				return createDualNonceStore(
+					createAdapterNonceStore(ctx.context.internalAdapter),
+					ssStore,
+				);
+			}
+			return ssStore;
 		}
 		return createAdapterNonceStore(ctx.context.internalAdapter);
 	};
