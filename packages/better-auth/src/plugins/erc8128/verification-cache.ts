@@ -60,7 +60,7 @@ export interface VerificationCacheAdapter {
  * block request processing.
  */
 export function createVerificationCacheOps(
-	strategy: "secondary-storage" | "database" | "memory",
+	strategy: "secondary-storage" | "database",
 	secondaryStorage: SecondaryStorage | undefined,
 	adapter: VerificationCacheAdapter,
 	fallbackMap: Map<string, CacheValue>,
@@ -100,7 +100,7 @@ export function createVerificationCacheOps(
 		};
 	}
 
-	// --- Shared: bounded in-memory Map helpers (used by both DB and memory strategies) ---
+	// --- Shared: bounded in-memory Map helpers ---
 	const setInMemory = (sig: string, value: CacheValue) => {
 		if (fallbackMap.has(sig)) fallbackMap.delete(sig);
 		fallbackMap.set(sig, value);
@@ -129,23 +129,6 @@ export function createVerificationCacheOps(
 			}
 		}
 	};
-
-	// --- Strategy: pure in-memory ---
-	if (strategy === "memory") {
-		return {
-			async get(sig) {
-				return fallbackMap.get(sig) ?? null;
-			},
-			async set(sig, value) {
-				setInMemory(sig, value);
-			},
-			async delete(sig) {
-				fallbackMap.delete(sig);
-			},
-			evictByKeyId: evictByKeyIdInMemory,
-			sweep: sweepInMemory,
-		};
-	}
 
 	// --- Strategy: DB (verification table) with in-memory read-through cache ---
 	// Reads check the in-memory Map first (fast L1), then fall back to a DB query.

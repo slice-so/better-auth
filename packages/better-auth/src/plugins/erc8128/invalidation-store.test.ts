@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { InvalidationAdapter } from "./invalidation-store";
 import {
 	createDBInvalidationOps,
 	createDualInvalidationOps,
@@ -8,45 +9,46 @@ import {
 // ---------------------------------------------------------------------------
 // Mock DB adapter
 // ---------------------------------------------------------------------------
+
 function createMockAdapter() {
-	const rows: Array<Record<string, any>> = [];
+	const rows: Array<Record<string, unknown>> = [];
 	let nextId = 1;
 
-	return {
-		rows,
-		adapter: {
-			async findMany(args: any) {
-				return rows.filter((r) =>
+	const adapter: InvalidationAdapter = {
+		async findMany(args) {
+			if (!args.where) return [...rows];
+			return rows.filter((r) =>
+				args.where!.every(
+					(w) => String(r[w.field] ?? "") === String(w.value ?? ""),
+				),
+			);
+		},
+		async findOne(args) {
+			return (
+				rows.find((r) =>
 					args.where.every(
-						(w: any) => r[w.field]?.toString() === w.value?.toString(),
+						(w) => String(r[w.field] ?? "") === String(w.value ?? ""),
 					),
-				);
-			},
-			async findOne(args: any) {
-				return (
-					rows.find((r) =>
-						args.where.every(
-							(w: any) => r[w.field]?.toString() === w.value?.toString(),
-						),
-					) ?? null
-				);
-			},
-			async create(args: any) {
-				const row = { id: String(nextId++), ...args.data };
-				rows.push(row);
-				return row;
-			},
-			async update(args: any) {
-				const row = rows.find((r) =>
-					args.where.every(
-						(w: any) => r[w.field]?.toString() === w.value?.toString(),
-					),
-				);
-				if (row) Object.assign(row, args.update);
-				return row;
-			},
+				) ?? null
+			);
+		},
+		async create(args) {
+			const row = { id: String(nextId++), ...args.data };
+			rows.push(row);
+			return row;
+		},
+		async update(args) {
+			const row = rows.find((r) =>
+				args.where.every(
+					(w) => String(r[w.field] ?? "") === String(w.value ?? ""),
+				),
+			);
+			if (row) Object.assign(row, args.update);
+			return (row as Record<string, unknown>) ?? null;
 		},
 	};
+
+	return { rows, adapter };
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +89,7 @@ describe("DB invalidation ops", () => {
 		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 1000);
 		const records = await ops.findByKeyId("erc8128:1:0xabc");
 		expect(records).toHaveLength(1);
-		expect(records[0].notBefore).toBe(1000);
+		expect(records[0]!.notBefore).toBe(1000);
 	});
 
 	it("updates existing per-keyId notBefore on second upsert", async () => {
@@ -98,7 +100,7 @@ describe("DB invalidation ops", () => {
 		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 2000);
 		const records = await ops.findByKeyId("erc8128:1:0xabc");
 		expect(records).toHaveLength(1);
-		expect(records[0].notBefore).toBe(2000);
+		expect(records[0]!.notBefore).toBe(2000);
 	});
 
 	it("upserts and finds per-signature invalidation", async () => {
@@ -135,7 +137,7 @@ describe("secondaryStorage invalidation ops", () => {
 		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 1500);
 		const records = await ops.findByKeyId("erc8128:1:0xabc");
 		expect(records).toHaveLength(1);
-		expect(records[0].notBefore).toBe(1500);
+		expect(records[0]!.notBefore).toBe(1500);
 	});
 
 	it("overwrites per-keyId notBefore on second upsert", async () => {
@@ -145,7 +147,7 @@ describe("secondaryStorage invalidation ops", () => {
 		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 1000);
 		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 2000);
 		const records = await ops.findByKeyId("erc8128:1:0xabc");
-		expect(records[0].notBefore).toBe(2000);
+		expect(records[0]!.notBefore).toBe(2000);
 	});
 
 	it("stores and retrieves per-signature invalidation", async () => {
@@ -210,7 +212,7 @@ describe("secondaryStorage invalidation ops", () => {
 describe("dual invalidation ops", () => {
 	it("writes to both DB and secondaryStorage", async () => {
 		const { adapter } = createMockAdapter();
-		const { storage, store } = createMockStorage();
+		const { storage } = createMockStorage();
 
 		const dbOps = createDBInvalidationOps(adapter);
 		const ssOps = createSecondaryStorageInvalidationOps(storage, 3600);
@@ -237,7 +239,7 @@ describe("dual invalidation ops", () => {
 		// Dual should find it via DB fallback
 		const records = await dualOps.findByKeyId("erc8128:1:0xdb-only");
 		expect(records).toHaveLength(1);
-		expect(records[0].notBefore).toBe(500);
+		expect(records[0]!.notBefore).toBe(500);
 	});
 
 	it("prefers secondaryStorage over DB on read", async () => {
@@ -253,7 +255,7 @@ describe("dual invalidation ops", () => {
 		await ssOps.upsertKeyIdNotBefore("erc8128:1:0xabc", 200);
 
 		const records = await dualOps.findByKeyId("erc8128:1:0xabc");
-		expect(records[0].notBefore).toBe(200); // SS wins
+		expect(records[0]!.notBefore).toBe(200); // SS wins
 	});
 
 	it("dual-writes signature invalidation", async () => {

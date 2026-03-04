@@ -1,4 +1,8 @@
-import type { EthHttpSigner, ServerConfig } from "@slicekit/erc8128";
+import type {
+	EthHttpSigner,
+	ServerConfig,
+	SignerClient,
+} from "@slicekit/erc8128";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@slicekit/erc8128", async () => {
@@ -24,6 +28,22 @@ const defaultAddress = "0x000000000000000000000000000000000000dEaD" as const;
 const defaultChainId = 1;
 const defaultKeyId = formatKeyId(defaultChainId, defaultAddress);
 const BASE_URL = "http://localhost:3000/api/auth";
+
+/** Default server config that allows replayable + class-bound. */
+const REPLAYABLE_CONFIG: ServerConfig = {
+	max_validity_sec: 300,
+	route_policies: {
+		default: { replayable: true, classBoundPolicies: ["@authority"] },
+	},
+};
+
+/** Server config that disables replayable globally. */
+const NON_REPLAYABLE_CONFIG: ServerConfig = {
+	max_validity_sec: 300,
+	route_policies: {
+		default: { replayable: false },
+	},
+};
 
 function createMockSigner(): EthHttpSigner {
 	return {
@@ -75,11 +95,11 @@ function mockSignRequestFn(opts?: {
 function setupMockSignerClient(signFn?: ReturnType<typeof mockSignRequestFn>) {
 	const fn = signFn ?? mockSignRequestFn();
 	vi.mocked(createSignerClient).mockReturnValue({
-		signRequest: fn as any,
-		signedFetch: vi.fn() as any,
-		fetch: vi.fn() as any,
-		setServerConfig: vi.fn() as any,
-	});
+		signRequest: fn,
+		signedFetch: vi.fn(),
+		fetch: vi.fn(),
+		setServerConfig: vi.fn(),
+	} as unknown as SignerClient);
 	return fn;
 }
 
@@ -90,7 +110,7 @@ async function setupPluginWithConfig(opts: {
 	signFn?: ReturnType<typeof mockSignRequestFn>;
 	expiryMarginSec?: number;
 	preferReplayable?: boolean;
-	minComponents?: string[];
+	components?: string[];
 	ttlSeconds?: number;
 	label?: string;
 	contentDigest?: "auto" | "recompute" | "require" | "off";
@@ -101,7 +121,7 @@ async function setupPluginWithConfig(opts: {
 		storage: opts.storage === undefined ? false : opts.storage,
 		expiryMarginSec: opts.expiryMarginSec,
 		preferReplayable: opts.preferReplayable,
-		minComponents: opts.minComponents,
+		components: opts.components,
 		ttlSeconds: opts.ttlSeconds,
 		label: opts.label,
 		contentDigest: opts.contentDigest,
@@ -109,7 +129,7 @@ async function setupPluginWithConfig(opts: {
 
 	if (opts.config && plugin.getActions) {
 		const mockFetch = vi.fn().mockResolvedValue({ data: opts.config });
-		(plugin.getActions as any)(mockFetch, {}, { baseURL: BASE_URL });
+		plugin.getActions(mockFetch as never, {} as never, undefined);
 		await vi.waitFor(() => {
 			if (!mockFetch.mock.results[0]?.value) throw new Error("pending");
 		});
@@ -123,8 +143,8 @@ async function setupPluginWithConfig(opts: {
 function getInitHook(plugin: ReturnType<typeof erc8128Client>) {
 	return plugin.fetchPlugins![0]!.init! as (
 		url: string,
-		fetchOptions?: Record<string, any>,
-	) => Promise<{ url: string; options?: Record<string, any> }>;
+		fetchOptions?: Record<string, unknown>,
+	) => Promise<{ url: string; options?: Record<string, unknown> }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,11 +259,8 @@ describe("erc8128Client", () => {
 		it("uses class-bound binding for replayable routes", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				components: [],
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -258,11 +275,8 @@ describe("erc8128Client", () => {
 		it("uses request-bound when server disables replayable", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
-				config: {
-					replay_protection: { replayable: false },
-					max_validity_sec: 300,
-				},
+				components: [],
+				config: NON_REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -277,11 +291,14 @@ describe("erc8128Client", () => {
 		it("respects per-route replayable: false override", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				config: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 					route_policies: {
+						default: {
+							replayable: true,
+							classBoundPolicies: ["@authority"],
+						},
 						"POST /api/auth/erc8128/invalidate": { replayable: false },
 					},
 				},
@@ -302,11 +319,14 @@ describe("erc8128Client", () => {
 		it("matches wildcard route policies", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				config: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 					route_policies: {
+						default: {
+							replayable: true,
+							classBoundPolicies: ["@authority"],
+						},
 						"GET /api/auth/admin/*": { replayable: false },
 					},
 				},
@@ -327,12 +347,9 @@ describe("erc8128Client", () => {
 			const store = createMockStore();
 			const { plugin } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -353,12 +370,9 @@ describe("erc8128Client", () => {
 			const store = createMockStore();
 			const { plugin } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
-				config: {
-					replay_protection: { replayable: false },
-					max_validity_sec: 300,
-				},
+				config: NON_REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -371,12 +385,9 @@ describe("erc8128Client", () => {
 			const store = createMockStore();
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -413,12 +424,9 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -449,12 +457,9 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				config: REPLAYABLE_CONFIG,
 				expiryMarginSec: 10,
 			});
 			const init = getInitHook(plugin);
@@ -482,13 +487,13 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
 				config: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 					route_policies: {
 						"GET /api/auth/session": {
+							replayable: true,
 							classBoundPolicies: ["@method", "@authority"],
 						},
 					},
@@ -523,14 +528,14 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
 				config: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 					route_policies: {
 						// Route requires @method + @authority + @target-uri
 						"GET /api/auth/session": {
+							replayable: true,
 							classBoundPolicies: ["@method", "@authority", "@target-uri"],
 						},
 					},
@@ -570,13 +575,13 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
 				config: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 					route_policies: {
 						"GET /api/auth/session": {
+							replayable: true,
 							classBoundPolicies: ["@method", "@authority"],
 						},
 					},
@@ -598,12 +603,12 @@ describe("erc8128Client", () => {
 		it("passes components from route policy to signRequest", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				config: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 					route_policies: {
 						"GET /api/auth/session": {
+							replayable: true,
 							classBoundPolicies: ["@method", "@authority"],
 						},
 					},
@@ -622,28 +627,25 @@ describe("erc8128Client", () => {
 			);
 		});
 
-		it("accepts cached sig when no classBoundPolicies defined on route", async () => {
+		it("accepts cached sig when it satisfies default classBoundPolicies", async () => {
 			const store = createMockStore();
 			const now = Math.floor(Date.now() / 1000);
 
+			// Cached sig covers @authority — matches REPLAYABLE_CONFIG default
 			store._map.set(defaultKeyId, [
 				{
 					signature: "cached-sig",
-					signatureInput: `sig1=("@method");created=${now};expires=${now + 300}`,
+					signatureInput: `sig1=("@authority");created=${now};expires=${now + 300}`,
 					expires: now + 300,
-					components: ["@method"],
+					components: ["@authority"],
 				},
 			]);
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-					// No route_policies — any components are fine
-				},
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -668,19 +670,19 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 				storage: store,
 				config: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 					route_policies: {
 						"GET /api/auth/session": {
+							replayable: true,
 							// list-of-lists: first requires @method+@target-uri,
 							// second requires @method+@authority — cached satisfies second
 							classBoundPolicies: [
 								["@method", "@target-uri"],
 								["@method", "@authority"],
-							] as any,
+							] as string[] | string[][],
 						},
 					},
 				},
@@ -700,12 +702,11 @@ describe("erc8128Client", () => {
 
 			const mockFetch = vi.fn().mockResolvedValue({
 				data: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 				},
 			});
 
-			(plugin.getActions as any)(mockFetch, {}, { baseURL: BASE_URL });
+			plugin.getActions!(mockFetch as never, {} as never, undefined);
 			await new Promise((r) => setTimeout(r, 0));
 
 			expect(mockFetch).toHaveBeenCalledWith("/.well-known/erc8128", {
@@ -730,10 +731,10 @@ describe("erc8128Client", () => {
 				storage: store,
 			});
 
-			const actions = (plugin.getActions as any)(
-				vi.fn().mockResolvedValue({}),
-				{},
-				{},
+			const actions = plugin.getActions!(
+				vi.fn().mockResolvedValue({}) as never,
+				{} as never,
+				undefined,
 			);
 
 			await actions.clearSignatureCache();
@@ -746,10 +747,7 @@ describe("erc8128Client", () => {
 		it("defaults to request-bound even when server allows replayable", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				// preferReplayable defaults to false
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -761,14 +759,11 @@ describe("erc8128Client", () => {
 			);
 		});
 
-		it("uses request-bound when preferReplayable is true but minComponents is undefined", async () => {
+		it("uses request-bound when preferReplayable is true but components is undefined", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				// minComponents not set → undefined → request-bound
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				// components not set → undefined → request-bound
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -780,15 +775,12 @@ describe("erc8128Client", () => {
 			);
 		});
 
-		it("does not cache when preferReplayable is true but minComponents is undefined", async () => {
+		it("does not cache when preferReplayable is true but components is undefined", async () => {
 			const store = createMockStore();
 			const { plugin } = await setupPluginWithConfig({
 				preferReplayable: true,
 				storage: store,
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -797,14 +789,11 @@ describe("erc8128Client", () => {
 			expect(store.set).not.toHaveBeenCalled();
 		});
 
-		it("uses class-bound when preferReplayable is true and minComponents is []", async () => {
+		it("uses class-bound when preferReplayable is true and components is []", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
-				config: {
-					replay_protection: { replayable: true },
-					max_validity_sec: 300,
-				},
+				components: [],
+				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -816,15 +805,15 @@ describe("erc8128Client", () => {
 			);
 		});
 
-		it("merges client minComponents with route classBoundPolicies", async () => {
+		it("merges client components with route classBoundPolicies", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: ["@method"],
+				components: ["@method"],
 				config: {
-					replay_protection: { replayable: true },
 					max_validity_sec: 300,
 					route_policies: {
 						"GET /api/auth/session": {
+							replayable: true,
 							classBoundPolicies: ["@authority", "@target-uri"],
 						},
 					},
@@ -850,11 +839,8 @@ describe("erc8128Client", () => {
 		it("falls back to request-bound when server disables replayable", async () => {
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
-				minComponents: [],
-				config: {
-					replay_protection: { replayable: false },
-					max_validity_sec: 300,
-				},
+				components: [],
+				config: NON_REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
@@ -872,7 +858,7 @@ describe("erc8128Client", () => {
 				signer: createMockSigner(),
 				storage: false,
 				preferReplayable: true,
-				minComponents: [],
+				components: [],
 			});
 			// Do NOT call getActions → serverConfig stays null
 			const init = getInitHook(plugin);

@@ -144,17 +144,7 @@ describe("erc8128 plugin", () => {
 			expect(response.status).toBe(200);
 			expect(data).toEqual({
 				verification_endpoint: "http://localhost:3000/api/auth/erc8128/verify",
-				signing_algorithms: ["eip191"],
-				account_types: ["eoa", "erc1271"],
-				replay_protection: {
-					non_replayable: true,
-					replayable: false,
-				},
 				max_validity_sec: 120,
-				clock_skew_sec: 15,
-				keyid_format: "erc8128:<chainId>:<address>",
-				signature_scheme: "rfc9421",
-				default_binding: "request-bound",
 			});
 			expect(data.invalidation_endpoint).toBeUndefined();
 		});
@@ -164,7 +154,9 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: {
+							default: { replayable: true },
+						},
 					}),
 				],
 			});
@@ -174,10 +166,6 @@ describe("erc8128 plugin", () => {
 			expect(data.invalidation_endpoint).toBe(
 				"http://localhost:3000/api/auth/erc8128/invalidate",
 			);
-			expect(data.replay_protection).toEqual({
-				non_replayable: true,
-				replayable: true,
-			});
 		});
 
 		it("includes route_policies when routePolicy is configured and omits false entries", async () => {

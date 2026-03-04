@@ -191,33 +191,33 @@ erc8128Client({
 })
 ```
 
-On initialization, the client fetches `GET /.well-known/erc8128` to learn the server's replay and route policy configuration. By default, all requests use **non-replayable, request-bound** signatures regardless of server config. To opt into replayable class-bound signing when the server allows it, set `preferReplayable` and `minComponents` — see [Signing Posture](#signing-posture).
+On initialization, the client fetches `GET /.well-known/erc8128` to learn the server's replay and route policy configuration. By default, all requests use **non-replayable, request-bound** signatures regardless of server config. To opt into replayable class-bound signing when the server allows it, set `preferReplayable` and `components` — see [Signing Posture](#signing-posture).
 
 ### Signing Posture
 
-The client controls its own signing posture via `preferReplayable` and `minComponents`. These map to `@slicekit/erc8128`'s `ClientOptions` — the plugin forwards all non-managed fields (`ttlSeconds`, `label`, `contentDigest`, etc.) to `signRequest` automatically.
+The client controls its own signing posture via `preferReplayable` and `components`. These map to `@slicekit/erc8128`'s `SignerClientOptions` — the plugin forwards all non-managed fields (`ttlSeconds`, `label`, `contentDigest`, etc.) to `signRequest` automatically.
 
-| `preferReplayable` | `minComponents` | Behavior |
+| `preferReplayable` | `components` | Behavior |
 | --- | --- | --- |
 | `false` (default) | *ignored* | Always request-bound, with nonce. |
 | `true` | `undefined` (default) | Replayable + request-bound when server allows. Not cached. |
 | `true` | `[]` | Replayable + class-bound with `@authority` only. Cached. |
 | `true` | `["@method", "@path"]` | Replayable + class-bound with at least these + `@authority`. Cached. |
 
-When `minComponents` is set, the client merges it with the route's `classBoundPolicies` from the server config — the signed components are always the union of both sets.
+When `components` is set, the client merges it with the route's `classBoundPolicies` from the server config — the signed components are always the union of both sets.
 
 ```ts title="Backend agent — class-bound with minimum components"
 erc8128Client({
   signer: agentSigner,
   preferReplayable: true,
-  minComponents: ["@method"],
+  components: ["@method"],
   storage: sigCache,
 })
 ```
 
 ### Signature Caching
 
-When `preferReplayable` is `true` and `minComponents` is set (even to `[]`), the client caches class-bound signatures and reuses them across requests — avoiding a cryptographic signing operation on every call.
+When `preferReplayable` is `true` and `components` is set (even to `[]`), the client caches class-bound signatures and reuses them across requests — avoiding a cryptographic signing operation on every call.
 
 Caching is controlled by the `storage` option:
 
@@ -332,7 +332,7 @@ For production deployments with multiple server instances, configure `secondaryS
 | --- | --- | --- | --- |
 | `signer` | `EthHttpSigner \| () => EthHttpSigner \| null` | — | Wallet signer for auto-signing. Without this, the plugin is type-only. |
 | `preferReplayable` | `boolean` | `false` | Whether to prefer replayable signatures when the server allows it — see [Signing Posture](#signing-posture). |
-| `minComponents` | `string[]` | — | Minimum class-bound components. `undefined` = request-bound only; `[]` = class-bound with `@authority`; `["@method"]` = at least `@authority` + `@method`. |
+| `components` | `string[]` | — | Minimum class-bound components. `undefined` = request-bound only; `[]` = class-bound with `@authority`; `["@method"]` = at least `@authority` + `@method`. |
 | `storage` | `"localStorage" \| Erc8128SignatureStore \| false` | auto | Where to cache replayable signatures — see [Signature Caching](#signature-caching). |
 | `storagePrefix` | `string` | `"erc8128"` | Key prefix for the built-in `localStorage` adapter. |
 | `expiryMarginSec` | `number` | `10` | Seconds before expiry to consider a cached signature stale. |

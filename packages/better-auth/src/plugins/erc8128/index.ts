@@ -11,7 +11,10 @@ import type {
 	VerifyPolicy,
 	VerifyResult,
 } from "@slicekit/erc8128";
-import { createVerifierClient } from "@slicekit/erc8128";
+import {
+	createVerifierClient,
+	formatDiscoveryDocument,
+} from "@slicekit/erc8128";
 import * as z from "zod";
 import { APIError } from "../../api";
 import { setSessionCookie } from "../../cookies";
@@ -40,6 +43,8 @@ import {
 	createVerificationCacheOps,
 	DEFAULT_CACHE_SIZE,
 } from "./verification-cache";
+
+const DEFAULT_MAX_VALIDITY_SEC = 300;
 
 declare module "@better-auth/core" {
 	interface BetterAuthPluginRegistry<AuthOptions, Options> {
@@ -113,7 +118,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 	const getCache = (ctx: GenericEndpointContext): VerificationCacheOps => {
 		if (!cacheOps) {
-			const resolved: "secondary-storage" | "database" | "memory" = ctx.context
+			const resolved: "secondary-storage" | "database" = ctx.context
 				.secondaryStorage
 				? "secondary-storage"
 				: "database";
@@ -132,7 +137,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 		if (!invalidationOpsInstance) {
 			const dbOps = createDBInvalidationOps(ctx.context.adapter);
 			if (ctx.context.secondaryStorage) {
-				const maxTtl = options.maxValiditySec ?? 300;
+				const maxTtl = options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC;
 				// Default TTL for invalidation records: generous upper bound
 				// so records outlive any signature they could invalidate
 				const invalidationTtl = Math.max(maxTtl * 2, 30 * 24 * 60 * 60);
@@ -387,7 +392,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							nonceStore: getNonceStore(ctx),
 							defaults: {
 								...options.defaultPolicy,
-								maxValiditySec: options.maxValiditySec ?? 300,
+								maxValiditySec: options.maxValiditySec,
 								clockSkewSec: options.clockSkewSec ?? 30,
 								maxSignatureVerifications: 1,
 								replayable: options.defaultPolicy?.replayable ?? false,
@@ -396,9 +401,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 											replayableNotBefore: async (keyid: string) => {
 												const inv = getInvalidationOps(ctx);
 												const records = await inv.findByKeyId(keyid);
-												const keyRecord = records.find(
-													(r) => !r.signature,
-												);
+												const keyRecord = records.find((r) => !r.signature);
 												return keyRecord?.notBefore ?? null;
 											},
 										}
@@ -427,9 +430,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									inv.findByKeyId(cached.keyId),
 									inv.findBySignature(signature),
 								]);
-								const notBeforeRecord = keyIdRecords.find(
-									(r) => !r.signature,
-								);
+								const notBeforeRecord = keyIdRecords.find((r) => !r.signature);
 
 								if (invalidatedRecord) {
 									await cache.delete(signature);
@@ -538,9 +539,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						if (replayableEnabled) {
 							const invOps = getInvalidationOps(ctx);
 							const records = await invOps.findByKeyId(result.params.keyid);
-							const notBeforeRecord = records.find(
-								(r) => !r.signature,
-							);
+							const notBeforeRecord = records.find((r) => !r.signature);
 							if (
 								notBeforeRecord &&
 								result.params.created < notBeforeRecord.notBefore
@@ -600,31 +599,18 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				},
 				async (ctx) => {
 					const baseURL = ctx.context.baseURL;
-					const routePolicies = options.routePolicy
-						? Object.fromEntries(
-								Object.entries(options.routePolicy).filter(
-									([key, value]) => key !== "default" && value !== false,
-								),
-							)
-						: undefined;
-					return ctx.json({
-						verification_endpoint: `${baseURL}/erc8128/verify`,
-						...(replayableEnabled
-							? { invalidation_endpoint: `${baseURL}/erc8128/invalidate` }
-							: {}),
-						signing_algorithms: ["eip191"],
-						account_types: ["eoa", "erc1271"],
-						replay_protection: {
-							non_replayable: true,
-							replayable: replayableEnabled,
-						},
-						max_validity_sec: options.maxValiditySec ?? 300,
-						clock_skew_sec: options.clockSkewSec ?? 30,
-						keyid_format: "erc8128:<chainId>:<address>",
-						signature_scheme: "rfc9421",
-						default_binding: "request-bound",
-						...(routePolicies ? { route_policies: routePolicies } : {}),
-					});
+
+					return ctx.json(
+						formatDiscoveryDocument({
+							verificationEndpoint: `${baseURL}/erc8128/verify`,
+							invalidationEndpoint: replayableEnabled
+								? `${baseURL}/erc8128/invalidate`
+								: undefined,
+							maxValiditySec:
+								options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC,
+							routePolicy: options.routePolicy,
+						}),
+					);
 				},
 			),
 			verifyErc8128: createAuthEndpoint(
@@ -641,7 +627,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						verifyMessage: options.verifyMessage,
 						nonceStore: getNonceStore(ctx),
 						defaults: {
-							maxValiditySec: options.maxValiditySec ?? 300,
+							maxValiditySec: options.maxValiditySec,
 							clockSkewSec: options.clockSkewSec ?? 30,
 							maxSignatureVerifications: 1,
 							replayable: false,
@@ -755,7 +741,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									verifyMessage: options.verifyMessage,
 									nonceStore: getNonceStore(ctx),
 									defaults: {
-										maxValiditySec: options.maxValiditySec ?? 300,
+										maxValiditySec: options.maxValiditySec,
 										clockSkewSec: options.clockSkewSec ?? 30,
 										maxSignatureVerifications: 1,
 										replayable: false,
@@ -808,7 +794,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								}
 
 								const invOps = getInvalidationOps(ctx);
-								const maxValidity = options.maxValiditySec ?? 300;
+								const maxValidity = options.maxValiditySec;
 
 								// Per-signature invalidation
 								if (ctx.body?.signature) {
@@ -816,7 +802,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									await invOps.upsertSignatureInvalidation(
 										result.params.keyid,
 										sigToInvalidate,
-										maxValidity,
+										maxValidity ?? DEFAULT_MAX_VALIDITY_SEC,
 									);
 
 									const sigCache = getCache(ctx);

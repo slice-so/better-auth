@@ -507,7 +507,7 @@
     "@better-fetch/fetch": "catalog:",
     "@noble/ciphers": "^2.1.1",
     "@noble/hashes": "^2.0.1",
-    "@slicekit/erc8128": "^0.2.0",
+    "@slicekit/erc8128": "0.3.1-beta.2",
     "better-call": "catalog:",
     "defu": "^6.1.4",
     "jose": "^6.1.3",

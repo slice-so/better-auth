@@ -1,4 +1,5 @@
 import type { SecondaryStorage } from "@better-auth/core/db";
+import type { Where } from "@better-auth/core/db/adapter";
 
 const INV_KEY_PREFIX = "erc8128:inv:keyid:";
 const INV_SIG_PREFIX = "erc8128:inv:sig:";
@@ -31,42 +32,69 @@ export interface InvalidationOps {
 	): Promise<void>;
 }
 
+/** Minimal adapter surface used by the invalidation store. */
+export interface InvalidationAdapter {
+	findMany(args: {
+		model: string;
+		where?: Where[];
+	}): Promise<Record<string, unknown>[]>;
+	findOne(args: {
+		model: string;
+		where: Where[];
+	}): Promise<Record<string, unknown> | null>;
+	create(args: {
+		model: string;
+		data: Record<string, unknown>;
+	}): Promise<Record<string, unknown>>;
+	update(args: {
+		model: string;
+		where: Where[];
+		update: Record<string, unknown>;
+	}): Promise<unknown>;
+}
+
+function toInvalidationRecord(
+	row: Record<string, unknown>,
+): InvalidationRecord {
+	return {
+		signature: typeof row.signature === "string" ? row.signature : undefined,
+		notBefore: typeof row.notBefore === "number" ? row.notBefore : 0,
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Database-backed implementation (current behavior)
 // ---------------------------------------------------------------------------
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function createDBInvalidationOps(adapter: any): InvalidationOps {
+export function createDBInvalidationOps(
+	adapter: InvalidationAdapter,
+): InvalidationOps {
 	return {
 		async findByKeyId(keyId: string): Promise<InvalidationRecord[]> {
-			return (await adapter.findMany({
+			const rows = await adapter.findMany({
 				model: "erc8128Invalidation",
-				where: [
-					{ field: "keyId", operator: "eq", value: keyId.toLowerCase() },
-				],
-			})) as InvalidationRecord[];
+				where: [{ field: "keyId", operator: "eq", value: keyId.toLowerCase() }],
+			});
+			return rows.map(toInvalidationRecord);
 		},
 
 		async findBySignature(
 			signature: string,
 		): Promise<InvalidationRecord | null> {
-			return (await adapter.findOne({
+			const row = await adapter.findOne({
 				model: "erc8128Invalidation",
 				where: [{ field: "signature", operator: "eq", value: signature }],
-			})) as InvalidationRecord | null;
+			});
+			return row ? toInvalidationRecord(row) : null;
 		},
 
 		async upsertKeyIdNotBefore(keyId: string, notBefore: number) {
 			const normalizedKeyId = keyId.toLowerCase();
-			const records = (await adapter.findMany({
+			const records = await adapter.findMany({
 				model: "erc8128Invalidation",
-				where: [
-					{ field: "keyId", operator: "eq", value: normalizedKeyId },
-				],
-			})) as Array<{ id: string; signature?: string }>;
-			const existing = records.find(
-				(r: { signature?: string }) => !r.signature,
-			);
+				where: [{ field: "keyId", operator: "eq", value: normalizedKeyId }],
+			});
+			const existing = records.find((r) => !r.signature);
 
 			if (!existing) {
 				await adapter.create({
@@ -80,7 +108,7 @@ export function createDBInvalidationOps(adapter: any): InvalidationOps {
 			} else {
 				await adapter.update({
 					model: "erc8128Invalidation",
-					where: [{ field: "id", operator: "eq", value: existing.id }],
+					where: [{ field: "id", operator: "eq", value: String(existing.id) }],
 					update: { notBefore, updatedAt: new Date() },
 				});
 			}
@@ -92,10 +120,10 @@ export function createDBInvalidationOps(adapter: any): InvalidationOps {
 			ttlSec: number,
 		) {
 			const expiresAt = Math.floor(Date.now() / 1000) + ttlSec;
-			const existing = (await adapter.findOne({
+			const existing = await adapter.findOne({
 				model: "erc8128Invalidation",
 				where: [{ field: "signature", operator: "eq", value: signature }],
-			})) as { id: string } | null;
+			});
 
 			if (!existing) {
 				await adapter.create({
@@ -111,7 +139,7 @@ export function createDBInvalidationOps(adapter: any): InvalidationOps {
 			} else {
 				await adapter.update({
 					model: "erc8128Invalidation",
-					where: [{ field: "id", operator: "eq", value: existing.id }],
+					where: [{ field: "id", operator: "eq", value: String(existing.id) }],
 					update: { expiresAt },
 				});
 			}

@@ -1,10 +1,15 @@
-import type { BetterAuthClientPlugin } from "@better-auth/core";
 import type {
-	Client as Erc8128SignerClient,
-	ClientOptions as Erc8128SignerClientOptions,
+	BetterAuthClientOptions,
+	BetterAuthClientPlugin,
+	ClientStore,
+} from "@better-auth/core";
+import type { BetterFetch, BetterFetchOption } from "@better-fetch/fetch";
+import type {
 	EthHttpSigner,
 	RoutePolicy,
 	ServerConfig,
+	SignerClient,
+	SignerClientOptions,
 } from "@slicekit/erc8128";
 import {
 	createSignerClient,
@@ -54,7 +59,7 @@ export interface Erc8128SignatureStore {
 type PluginManagedOptions = "serverConfigs" | "fetch";
 
 export interface Erc8128ClientOptions
-	extends Omit<Erc8128SignerClientOptions, PluginManagedOptions> {
+	extends Omit<SignerClientOptions, PluginManagedOptions> {
 	/**
 	 * ERC-8128 signer identity. Can be a static object or a function
 	 * returning one (for lazy/dynamic wallet connections).
@@ -194,7 +199,6 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 		expiryMarginSec,
 		storage: _storage,
 		preferReplayable = false,
-		minComponents,
 		...forwardedSignOptions
 	} = options;
 
@@ -202,7 +206,7 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 	const margin = expiryMarginSec ?? 10;
 
 	let serverConfig: ServerConfig | null = null;
-	let signerClient: Erc8128SignerClient | null = null;
+	let signerClient: SignerClient | null = null;
 	let signerKey = "";
 
 	// -- signer resolution ---------------------------------------------------
@@ -214,7 +218,7 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 		return options!.signer ?? null;
 	}
 
-	function getClient(signer: EthHttpSigner): Erc8128SignerClient {
+	function getClient(signer: EthHttpSigner): SignerClient {
 		const key = `${signer.chainId}:${signer.address.toLowerCase()}`;
 		if (signerClient && signerKey === key) return signerClient;
 		signerClient = createSignerClient(signer);
@@ -232,15 +236,17 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 		id: "erc8128",
 		$InferServerPlugin: {} as ReturnType<typeof erc8128>,
 		getActions: (
-			$fetch: (...args: any[]) => Promise<any>,
-			_$store: any,
-			_clientOptions: any,
+			$fetch: BetterFetch,
+			_$store: ClientStore,
+			_clientOptions: BetterAuthClientOptions | undefined,
 		) => {
 			$fetch("/.well-known/erc8128", { method: "GET" })
-				.then((result: any) => {
-					const data = result?.data ?? result;
-					if (data?.replay_protection) {
-						serverConfig = data;
+				.then((result) => {
+					// BetterFetch wraps responses in { data, error }
+					const response = result as { data?: Record<string, unknown> | null };
+					const payload = response.data;
+					if (payload && typeof payload.max_validity_sec === "number") {
+						serverConfig = payload as ServerConfig;
 					}
 				})
 				.catch(() => {});
@@ -256,7 +262,7 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 			{
 				id: "erc8128-signer",
 				name: "erc8128-signer",
-				init: async (url: string, fetchOptions?: Record<string, any>) => {
+				init: async (url: string, fetchOptions?: BetterFetchOption) => {
 					const signer = resolveSigner();
 					if (!signer) return { url, options: fetchOptions };
 
@@ -282,14 +288,16 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 
 					// -- determine signing posture via library ----------------------
 					// When server config hasn't loaded yet, use safest posture.
+					const wantsClassBound =
+						preferReplayable && forwardedSignOptions.components !== undefined;
 					const posture = serverConfig
-						? resolvePosture(
-								method,
-								parsedUrl.pathname,
-								preferReplayable,
-								minComponents,
-								serverConfig,
-							)
+						? resolvePosture(method, parsedUrl.pathname, serverConfig, {
+								...forwardedSignOptions,
+								binding: wantsClassBound
+									? "class-bound"
+									: (forwardedSignOptions.binding ?? "request-bound"),
+								replay: preferReplayable ? "replayable" : "non-replayable",
+							})
 						: {
 								binding: "request-bound" as const,
 								replay: "non-replayable" as const,
