@@ -273,22 +273,39 @@ When verification is required and fails, the response includes:
 
 Along with `Accept-Signature` and `WWW-Authenticate` headers indicating the expected signature components.
 
-## Verification Cache
+## Storage
 
-When any route allows replayable signatures, the plugin caches successful verification results so that subsequent requests carrying the same signature skip the expensive cryptographic re-verification (which may involve on-chain RPC calls for ERC-1271 smart contract wallets).
+The plugin manages three types of ephemeral data — all with bounded lifetimes tied to signature validity:
 
-The plugin uses three storage mechanisms with different durability requirements:
-
-| Concern | Storage | Why |
+| Concern | Purpose | Durability |
 | --- | --- | --- |
-| **Nonce / replay protection** | Database (`verification` table) | Security-critical. A lost nonce could allow a replay attack. |
-| **Signature invalidation** | Database (`erc8128Invalidation` table) | Security-critical. Losing state would re-enable revoked signatures. |
-| **Verification cache** | `secondaryStorage` if configured, otherwise database, with in-memory LRU eviction | Performance optimization only. A cache miss triggers a full re-verification — no security impact. |
+| **Nonce tracking** | Prevent replay of non-replayable signatures | Security-critical |
+| **Signature invalidation** | Revoke replayable signatures | Security-critical |
+| **Verification cache** | Skip re-verification for known-good replayable signatures | Performance only |
 
-If Better Auth's `secondaryStorage` is configured (e.g. Redis), the cache uses it automatically — entries are stored with a TTL matching the signature's remaining validity, shared across all instances. Otherwise, the cache falls back to the database (`verification` table) with a per-process in-memory read-through Map.
+### Secondary Storage
+
+When Better Auth's [`secondaryStorage`](/docs/concepts/session-management#sessions-in-secondary-storage) is configured (e.g. Redis), **all three are stored there by default** — with TTL-based auto-cleanup. This is faster than database queries and eliminates the need for manual cleanup of expired records.
+
+To also persist nonces and invalidation records to the database (dual-write with secondaryStorage as fast read-through), set `storeInDatabase`:
+
+```ts title="auth.ts"
+erc8128({
+  verifyMessage: publicClient.verifyMessage,
+  storeInDatabase: true, // [!code highlight]
+})
+```
+
+This follows the same pattern as Better Auth's [`session.storeSessionInDatabase`](/docs/concepts/session-management#sessions-in-secondary-storage).
+
+| `secondaryStorage` | `storeInDatabase` | Nonce | Invalidation | Cache |
+| --- | --- | --- | --- | --- |
+| Not configured | — | Database | Database | Database + in-memory |
+| Configured | `false` (default) | secondaryStorage | secondaryStorage | secondaryStorage |
+| Configured | `true` | Database + secondaryStorage | Database + secondaryStorage | secondaryStorage |
 
 <Callout>
-ERC-8128 involves cryptographic signature verification on every request. For production deployments, configure Better Auth's `secondaryStorage` (e.g. Redis) so the verification cache is shared across all server instances and survives restarts.
+For production deployments with multiple server instances, configure `secondaryStorage` (e.g. Redis) so nonce tracking, invalidation, and verification caching are shared across all instances.
 </Callout>
 
 ## Options
@@ -303,6 +320,7 @@ ERC-8128 involves cryptographic signature verification on every request. For pro
 | `sessionExpiresIn` | `number` | — | Session TTL in seconds (for `/erc8128/verify`). |
 | `maxValiditySec` | `number` | `300` | Maximum signature validity window (seconds). |
 | `clockSkewSec` | `number` | `30` | Allowed clock skew (seconds). |
+| `storeInDatabase` | `boolean` | `false` | When `secondaryStorage` is configured, also persist nonces and invalidation to the database. See [Storage](#storage). |
 | `cacheSize` | `number` | `10000` | Max entries in the in-memory verification cache. Ignored when `secondaryStorage` is active. |
 | `emailDomainName` | `string` | From `baseURL` | Domain for auto-generated user emails. |
 | `anonymous` | `boolean` | `true` | If `false`, email is required on verify. |

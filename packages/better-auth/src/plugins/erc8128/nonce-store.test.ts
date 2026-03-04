@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { createAdapterNonceStore } from "./nonce-store";
+import {
+	createAdapterNonceStore,
+	createSecondaryStorageNonceStore,
+} from "./nonce-store";
 
 describe("erc8128 nonce store", () => {
 	it("consumes nonce only once", async () => {
@@ -24,6 +27,24 @@ describe("erc8128 nonce store", () => {
 		const store = createAdapterNonceStore(adapter);
 		const first = await store.consume("nonce-key", 60);
 		const second = await store.consume("nonce-key", 60);
+
+		expect(first).toBe(true);
+		expect(second).toBe(false);
+	});
+
+	it("falls back to in-memory map when adapter throws", async () => {
+		const adapter = {
+			async findVerificationValue() {
+				throw new Error("DB down");
+			},
+			async createVerificationValue() {
+				throw new Error("DB down");
+			},
+		};
+
+		const store = createAdapterNonceStore(adapter);
+		const first = await store.consume("fallback-key", 60);
+		const second = await store.consume("fallback-key", 60);
 
 		expect(first).toBe(true);
 		expect(second).toBe(false);
@@ -64,5 +85,75 @@ describe("erc8128 nonce store", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("secondaryStorage nonce store", () => {
+	function createMockStorage() {
+		const store = new Map<string, { value: string; expiresAt: number }>();
+		return {
+			store,
+			storage: {
+				async get(key: string) {
+					const entry = store.get(key);
+					if (!entry) return null;
+					if (entry.expiresAt <= Date.now()) {
+						store.delete(key);
+						return null;
+					}
+					return entry.value;
+				},
+				async set(key: string, value: string, ttl?: number) {
+					store.set(key, {
+						value,
+						expiresAt: Date.now() + (ttl ?? 3600) * 1000,
+					});
+				},
+				async delete(key: string) {
+					store.delete(key);
+				},
+			},
+		};
+	}
+
+	it("consumes nonce only once", async () => {
+		const { storage } = createMockStorage();
+		const nonceStore = createSecondaryStorageNonceStore(storage);
+
+		expect(await nonceStore.consume("ss-nonce-1", 60)).toBe(true);
+		expect(await nonceStore.consume("ss-nonce-1", 60)).toBe(false);
+	});
+
+	it("allows reuse after TTL expiry", async () => {
+		vi.useFakeTimers();
+		try {
+			const { storage } = createMockStorage();
+			const nonceStore = createSecondaryStorageNonceStore(storage);
+
+			expect(await nonceStore.consume("ss-ttl-nonce", 1)).toBe(true);
+			expect(await nonceStore.consume("ss-ttl-nonce", 1)).toBe(false);
+
+			vi.advanceTimersByTime(1100);
+			expect(await nonceStore.consume("ss-ttl-nonce", 1)).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("returns false when storage throws", async () => {
+		const storage = {
+			async get() {
+				throw new Error("Redis down");
+			},
+			async set() {
+				throw new Error("Redis down");
+			},
+			async delete() {
+				throw new Error("Redis down");
+			},
+		};
+
+		const nonceStore = createSecondaryStorageNonceStore(storage);
+		expect(await nonceStore.consume("err-nonce", 60)).toBe(false);
 	});
 });
