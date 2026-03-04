@@ -12,7 +12,6 @@ import type {
 	VerifyResult,
 } from "@slicekit/erc8128";
 import { createVerifierClient } from "@slicekit/erc8128";
-import { serializeSignedCookie } from "better-call";
 import * as z from "zod";
 import { APIError } from "../../api";
 import { setSessionCookie } from "../../cookies";
@@ -43,9 +42,7 @@ declare module "@better-auth/core" {
 export interface ERC8128PluginOptions {
 	verifyMessage: VerifyMessageFn;
 	defaultPolicy?: VerifyPolicy | undefined;
-	createSession?: boolean | undefined;
 	sessionExpiresIn?: number | undefined;
-	allowReplayable?: boolean | undefined;
 	maxValiditySec?: number | undefined;
 	clockSkewSec?: number | undefined;
 	emailDomainName?: string | undefined;
@@ -78,6 +75,13 @@ const invalidateBodySchema = z
 	});
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
+	const replayableEnabled =
+		options.defaultPolicy?.replayable === true ||
+		(options.routePolicy != null &&
+			Object.values(options.routePolicy).some(
+				(p) => typeof p === "object" && p !== null && p.replayable === true,
+			));
+
 	const fallbackCacheMap = new Map<string, CacheValue>();
 	const maxCacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
 	let cacheOps: VerificationCacheOps | null = null;
@@ -97,6 +101,108 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			);
 		}
 		return cacheOps;
+	};
+
+	const findOrCreateWalletUser = async (
+		ctx: GenericEndpointContext,
+		walletAddress: string,
+		chainId: number,
+		email?: string,
+	): Promise<User | null> => {
+		// 1. Exact match: address + chainId
+		const existingWallet: WalletAddress | null =
+			await ctx.context.adapter.findOne({
+				model: "walletAddress",
+				where: [
+					{ field: "address", operator: "eq", value: walletAddress },
+					{ field: "chainId", operator: "eq", value: chainId },
+				],
+			});
+
+		if (existingWallet) {
+			const user = await ctx.context.adapter.findOne<User>({
+				model: "user",
+				where: [{ field: "id", operator: "eq", value: existingWallet.userId }],
+			});
+			if (user) return user;
+		}
+
+		// 2. Same address on a different chain → reuse that user
+		const anyWallet: WalletAddress | null = await ctx.context.adapter.findOne({
+			model: "walletAddress",
+			where: [{ field: "address", operator: "eq", value: walletAddress }],
+		});
+
+		let user: User | null = null;
+		if (anyWallet) {
+			user = await ctx.context.adapter.findOne({
+				model: "user",
+				where: [{ field: "id", operator: "eq", value: anyWallet.userId }],
+			});
+		}
+
+		// 3. Create new user if none found
+		if (!user) {
+			const isAnon = options.anonymous ?? true;
+			if (!isAnon && !email) {
+				return null;
+			}
+			const domain = options.emailDomainName ?? getOrigin(ctx.context.baseURL);
+			const userEmail = !isAnon && email ? email : `${walletAddress}@${domain}`;
+			const { name, avatar } =
+				(await options.ensLookup?.({ walletAddress })) ?? {};
+
+			user = await ctx.context.internalAdapter.createUser({
+				name: name ?? walletAddress,
+				email: userEmail,
+				image: avatar ?? "",
+			});
+
+			await ctx.context.adapter.create({
+				model: "walletAddress",
+				data: {
+					userId: user.id,
+					address: walletAddress,
+					chainId,
+					isPrimary: true,
+					createdAt: new Date(),
+				},
+			});
+
+			await ctx.context.internalAdapter.createAccount({
+				userId: user.id,
+				providerId: "erc8128",
+				accountId: `${walletAddress}:${chainId}`,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			});
+
+			return user;
+		}
+
+		// 4. Existing user, new chain → add wallet + account
+		if (!existingWallet) {
+			await ctx.context.adapter.create({
+				model: "walletAddress",
+				data: {
+					userId: user.id,
+					address: walletAddress,
+					chainId,
+					isPrimary: false,
+					createdAt: new Date(),
+				},
+			});
+
+			await ctx.context.internalAdapter.createAccount({
+				userId: user.id,
+				providerId: "erc8128",
+				accountId: `${walletAddress}:${chainId}`,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			});
+		}
+
+		return user;
 	};
 
 	const verifyBodySchema = z
@@ -164,6 +270,15 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							return;
 						}
 
+						// If a session cookie is present, skip ERC-8128 verification
+						// and let normal session handling authenticate the request.
+						const cookieHeader = incomingHeaders.get("cookie") || "";
+						if (
+							cookieHeader.includes(ctx.context.authCookies.sessionToken.name)
+						) {
+							return;
+						}
+
 						const resolvedRoutePolicy = ctx.request
 							? resolveRoutePolicy(options.routePolicy, ctx.request)
 							: ({
@@ -212,11 +327,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								maxValiditySec: options.maxValiditySec ?? 300,
 								clockSkewSec: options.clockSkewSec ?? 30,
 								maxSignatureVerifications: 1,
-								replayable:
-									options.defaultPolicy?.replayable ??
-									options.allowReplayable ??
-									false,
-								...(options.allowReplayable
+								replayable: options.defaultPolicy?.replayable ?? false,
+								...(replayableEnabled
 									? {
 											replayableNotBefore: async (keyid: string) => {
 												const records = await ctx.context.adapter.findMany<{
@@ -252,11 +364,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						// Check replayable signature cache before full verification
 						let result: VerifyResult | null = null;
 						const cache = getCache(ctx);
-						if (
-							signature &&
-							options.allowReplayable &&
-							!resolvedRoutePolicy.policy
-						) {
+						if (signature && replayableEnabled && !resolvedRoutePolicy.policy) {
 							cache.sweep();
 
 							const cached = await cache.get(signature);
@@ -396,7 +504,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							);
 						}
 
-						if (options.allowReplayable) {
+						if (replayableEnabled) {
 							const records = await ctx.context.adapter.findMany<{
 								signature?: string;
 								notBefore: number;
@@ -438,7 +546,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						}
 
 						// Cache replayable verification result
-						if (signature && result.replayable && options.allowReplayable) {
+						if (signature && result.replayable && replayableEnabled) {
 							const ttlSec =
 								result.params.expires - Math.floor(Date.now() / 1000);
 							if (ttlSec > 0) {
@@ -458,45 +566,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 						const walletAddress = result.address;
 						const chainId = result.chainId;
-						const found = await ctx.context.adapter.findOne<WalletAddress>({
-							model: "walletAddress",
-							where: [
-								{ field: "address", operator: "eq", value: walletAddress },
-								{ field: "chainId", operator: "eq", value: chainId },
-							],
-						});
-
-						// No known wallet or session creation disabled — stop after verification
-						if (!found || options.createSession === false) {
-							return;
-						}
-
-						const session = await ctx.context.internalAdapter.createSession(
-							found.userId,
-						);
-						const signedToken = await serializeSignedCookie(
-							"",
-							session.token,
-							ctx.context.secret,
-						);
-
-						const existingHeaders = (ctx.request?.headers ||
-							ctx.headers) as Headers;
-						const headers = new Headers({
-							...Object.fromEntries(existingHeaders.entries()),
-						});
-						const existingCookie = headers.get("cookie");
-						const newCookie = `${ctx.context.authCookies.sessionToken.name}=${signedToken.replace("=", "")}`;
-						headers.set(
-							"cookie",
-							existingCookie ? `${existingCookie}; ${newCookie}` : newCookie,
-						);
-
-						return {
-							context: {
-								headers,
-							},
-						};
+						await findOrCreateWalletUser(ctx, walletAddress, chainId);
 					}),
 				},
 			],
@@ -519,21 +589,20 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						: undefined;
 					return ctx.json({
 						verification_endpoint: `${baseURL}/erc8128/verify`,
-						...(options.allowReplayable
+						...(replayableEnabled
 							? { invalidation_endpoint: `${baseURL}/erc8128/invalidate` }
 							: {}),
 						signing_algorithms: ["eip191"],
 						account_types: ["eoa", "erc1271"],
 						replay_protection: {
 							non_replayable: true,
-							replayable: options.allowReplayable ?? false,
+							replayable: replayableEnabled,
 						},
 						max_validity_sec: options.maxValiditySec ?? 300,
 						clock_skew_sec: options.clockSkewSec ?? 30,
 						keyid_format: "erc8128:<chainId>:<address>",
 						signature_scheme: "rfc9421",
 						default_binding: "request-bound",
-						session_creation: options.createSession !== false,
 						...(routePolicies ? { route_policies: routePolicies } : {}),
 					});
 				},
@@ -614,124 +683,16 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						});
 					}
 
-					// Look for existing user by their wallet addresses
-					let user: User | null = null;
-
-					// Check if there's a wallet address record for this exact address+chainId combination
-					const existingWalletAddress: WalletAddress | null =
-						await ctx.context.adapter.findOne({
-							model: "walletAddress",
-							where: [
-								{ field: "address", operator: "eq", value: walletAddress },
-								{ field: "chainId", operator: "eq", value: chainId },
-							],
-						});
-
-					if (existingWalletAddress) {
-						// Get the user associated with this wallet address
-						user = await ctx.context.adapter.findOne({
-							model: "user",
-							where: [
-								{
-									field: "id",
-									operator: "eq",
-									value: existingWalletAddress.userId,
-								},
-							],
-						});
-					} else {
-						// No exact match found, check if this address exists on any other chain
-						const anyWalletAddress: WalletAddress | null =
-							await ctx.context.adapter.findOne({
-								model: "walletAddress",
-								where: [
-									{ field: "address", operator: "eq", value: walletAddress },
-								],
-							});
-
-						if (anyWalletAddress) {
-							// Same address exists on different chain, get that user
-							user = await ctx.context.adapter.findOne({
-								model: "user",
-								where: [
-									{
-										field: "id",
-										operator: "eq",
-										value: anyWalletAddress.userId,
-									},
-								],
-							});
-						}
-					}
-
-					// Create new user if none exists
+					const user = await findOrCreateWalletUser(
+						ctx,
+						walletAddress,
+						chainId,
+						ctx.body?.email,
+					);
 					if (!user) {
-						const domain =
-							options.emailDomainName ?? getOrigin(ctx.context.baseURL);
-						const userEmail =
-							!isAnon && ctx.body?.email
-								? ctx.body.email
-								: `${walletAddress}@${domain}`;
-						const { name, avatar } =
-							(await options.ensLookup?.({ walletAddress })) ?? {};
-
-						user = await ctx.context.internalAdapter.createUser({
-							name: name ?? walletAddress,
-							email: userEmail,
-							image: avatar ?? "",
-						});
-
-						// Create wallet address record
-						await ctx.context.adapter.create({
-							model: "walletAddress",
-							data: {
-								userId: user.id,
-								address: walletAddress,
-								chainId,
-								isPrimary: true, // First address is primary
-								createdAt: new Date(),
-							},
-						});
-
-						// Create account record for wallet authentication
-						await ctx.context.internalAdapter.createAccount({
-							userId: user.id,
-							providerId: "erc8128",
-							accountId: `${walletAddress}:${chainId}`,
-							createdAt: new Date(),
-							updatedAt: new Date(),
-						});
-					} else if (!existingWalletAddress) {
-						// User exists on another chain — add this new chainId
-						await ctx.context.adapter.create({
-							model: "walletAddress",
-							data: {
-								userId: user.id,
-								address: walletAddress,
-								chainId,
-								isPrimary: false, // Additional addresses are not primary by default
-								createdAt: new Date(),
-							},
-						});
-
-						// Create account record for this new wallet+chain combination
-						await ctx.context.internalAdapter.createAccount({
-							userId: user.id,
-							providerId: "erc8128",
-							accountId: `${walletAddress}:${chainId}`,
-							createdAt: new Date(),
-							updatedAt: new Date(),
-						});
-					}
-
-					if (options.createSession === false) {
-						return ctx.json({
-							success: true,
-							user: {
-								id: user.id,
-								walletAddress,
-								chainId,
-							},
+						throw APIError.fromStatus("INTERNAL_SERVER_ERROR", {
+							message: "Failed to create or find user",
+							status: 500,
 						});
 					}
 
@@ -760,7 +721,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					});
 				},
 			),
-			...(options.allowReplayable
+			...(replayableEnabled
 				? {
 						invalidateErc8128: createAuthEndpoint(
 							"/erc8128/invalidate",
@@ -776,10 +737,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 										ctx.context.internalAdapter,
 									),
 									defaults: {
-										...options.defaultPolicy,
-										replayable: false,
 										maxValiditySec: options.maxValiditySec ?? 300,
 										clockSkewSec: options.clockSkewSec ?? 30,
+										maxSignatureVerifications: 1,
+										replayable: false,
 									},
 								});
 

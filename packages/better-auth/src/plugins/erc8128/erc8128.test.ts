@@ -123,7 +123,7 @@ describe("erc8128 plugin", () => {
 
 		const replayable = erc8128({
 			verifyMessage: async () => true,
-			allowReplayable: true,
+			defaultPolicy: { replayable: true },
 		});
 		expect(replayable.schema).toEqual(erc8128Schema);
 	});
@@ -136,7 +136,6 @@ describe("erc8128 plugin", () => {
 						verifyMessage: async () => true,
 						maxValiditySec: 120,
 						clockSkewSec: 15,
-						createSession: false,
 					}),
 				],
 			});
@@ -156,7 +155,6 @@ describe("erc8128 plugin", () => {
 				keyid_format: "erc8128:<chainId>:<address>",
 				signature_scheme: "rfc9421",
 				default_binding: "request-bound",
-				session_creation: false,
 			});
 			expect(data.invalidation_endpoint).toBeUndefined();
 		});
@@ -166,7 +164,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
@@ -327,37 +325,190 @@ describe("erc8128 plugin", () => {
 			expect(first.response.status).toBe(200);
 			expect(second.response.status).toBe(401);
 		});
+
+		it("rejects class-bound signatures even when non-replayable", async () => {
+			mockVerifier(async () => failResult("not_request_bound"));
+			const { auth } = await getTestInstance({
+				plugins: [erc8128({ verifyMessage: async () => true })],
+			});
+
+			const { response, data } = await post(auth, "/erc8128/verify");
+			expect(response.status).toBe(401);
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "not_request_bound",
+			});
+		});
+
+		it("rejects replayable signatures even when request-bound", async () => {
+			mockVerifier(async () => failResult("replayable_not_allowed"));
+			const { auth } = await getTestInstance({
+				plugins: [erc8128({ verifyMessage: async () => true })],
+			});
+
+			const { response, data } = await post(auth, "/erc8128/verify");
+			expect(response.status).toBe(401);
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "replayable_not_allowed",
+			});
+		});
+
+		it("accepts request-bound non-replayable signatures", async () => {
+			mockVerifier(async () => okResult({ replayable: false }));
+			const { auth } = await getTestInstance({
+				plugins: [erc8128({ verifyMessage: async () => true })],
+			});
+
+			const { response, data } = await post(auth, "/erc8128/verify");
+			expect(response.status).toBe(200);
+			expect(data.success).toBe(true);
+		});
 	});
 
 	describe("hooks.before", () => {
-		it("valid ERC-8128 Authorization header authenticates request via middleware", async () => {
-			const signature = "sig-valid-hook";
-			const verifySpy = vi.fn(async () => okResult({ replayable: true }));
-			vi.mocked(createVerifierClient).mockImplementation(() => ({
-				verifyRequest: verifySpy,
-			}));
-
+		it("middleware verifies signature and upserts user but does not create a session", async () => {
+			mockVerifier(async () => okResult());
 			const { auth } = await getTestInstance({
-				plugins: [
-					erc8128({
-						verifyMessage: async () => true,
-						allowReplayable: true,
-					}),
-				],
+				plugins: [erc8128({ verifyMessage: async () => true })],
 			});
 
-			// Ensure wallet exists before hook-based auth tries to create a session
-			await post(auth, "/erc8128/verify");
+			const ctx = await auth.$context;
 
 			const { data, response } = await get(auth, "/get-session", {
 				headers: {
 					authorization: "ERC-8128 auth",
-					signature,
+					signature: "sig-valid-hook",
 				},
 			});
 			expect(response.status).toBe(200);
-			expect(data.session).toBeDefined();
-			expect(data.user).toBeDefined();
+			// Middleware does not create sessions — only /verify does
+			expect(data === null || data.session === null).toBe(true);
+
+			// But user + wallet were created
+			const wallets = await ctx.adapter.findMany<WalletAddress>({
+				model: "walletAddress",
+				where: [{ field: "address", operator: "eq", value: defaultAddress }],
+			});
+			expect(wallets).toHaveLength(1);
+		});
+
+		it("middleware creates user + wallet on first signed request without prior /verify", async () => {
+			mockVerifier(async () => okResult());
+			const { auth } = await getTestInstance({
+				plugins: [erc8128({ verifyMessage: async () => true })],
+			});
+
+			const ctx = await auth.$context;
+
+			// No users other than the default test user
+			const usersBefore = await ctx.adapter.findMany({ model: "user" });
+			const walletsBefore = await ctx.adapter.findMany({
+				model: "walletAddress",
+			});
+			expect(usersBefore).toHaveLength(1); // default test user
+			expect(walletsBefore).toHaveLength(0);
+
+			// Signed request to middleware — should auto-create user + wallet (no session)
+			const { data, response } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 first-contact",
+					signature: "sig-first",
+				},
+			});
+			expect(response.status).toBe(200);
+			// Middleware never creates sessions
+			expect(data === null || data.session === null).toBe(true);
+
+			const usersAfter = await ctx.adapter.findMany({ model: "user" });
+			const walletsAfter = await ctx.adapter.findMany<WalletAddress>({
+				model: "walletAddress",
+				where: [{ field: "address", operator: "eq", value: defaultAddress }],
+			});
+			const accounts = await ctx.adapter.findMany<{ providerId: string }>({
+				model: "account",
+				where: [{ field: "providerId", operator: "eq", value: "erc8128" }],
+			});
+
+			expect(usersAfter).toHaveLength(2); // default test user + new wallet user
+			expect(walletsAfter).toHaveLength(1);
+			expect(walletsAfter[0]?.isPrimary).toBe(true);
+			expect(accounts).toHaveLength(1);
+		});
+
+		it("middleware links same address on different chain to existing user", async () => {
+			let call = 0;
+			mockVerifier(async () => {
+				call += 1;
+				return call === 1
+					? okResult({ chainId: 1 })
+					: okResult({ chainId: 137, keyId: formatKeyId(137, defaultAddress) });
+			});
+
+			const { auth } = await getTestInstance({
+				plugins: [erc8128({ verifyMessage: async () => true })],
+			});
+
+			const ctx = await auth.$context;
+
+			// First signed request — creates user on chain 1
+			await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 chain1",
+					signature: "sig-chain1",
+				},
+			});
+
+			// Second signed request — same address, different chain
+			await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 chain137",
+					signature: "sig-chain137",
+				},
+			});
+
+			const wallets = await ctx.adapter.findMany<WalletAddress>({
+				model: "walletAddress",
+				where: [{ field: "address", operator: "eq", value: defaultAddress }],
+			});
+			expect(wallets).toHaveLength(2);
+			expect(wallets.find((w) => w.chainId === 1)?.isPrimary).toBe(true);
+			expect(wallets.find((w) => w.chainId === 137)?.isPrimary).toBe(false);
+
+			// Same user for both
+			expect(wallets[0]?.userId).toBe(wallets[1]?.userId);
+		});
+
+		it("middleware with anonymous: false silently passes through for unknown wallets (no email)", async () => {
+			mockVerifier(async () => okResult());
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						anonymous: false,
+					}),
+				],
+			});
+
+			const ctx = await auth.$context;
+
+			// Middleware can't provide an email, so findOrCreateWalletUser returns null
+			const { data, response } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 anon-off",
+					signature: "sig-anon",
+				},
+			});
+			expect(response.status).toBe(200);
+			// No session — user creation failed (no email)
+			expect(data === null || data.session === null).toBe(true);
+
+			// No wallet created
+			const wallets = await ctx.adapter.findMany({
+				model: "walletAddress",
+				where: [{ field: "address", operator: "eq", value: defaultAddress }],
+			});
+			expect(wallets).toHaveLength(0);
 		});
 
 		it("request without ERC-8128 header passes through without interference", async () => {
@@ -449,16 +600,14 @@ describe("erc8128 plugin", () => {
 				],
 			});
 
-			await post(auth, "/erc8128/verify");
-			const { response, data } = await get(auth, "/get-session", {
+			// Valid signature — middleware verifies and allows through (no session created)
+			const { response } = await get(auth, "/get-session", {
 				headers: {
 					authorization: "ERC-8128 valid",
 					signature: "sig-ok",
 				},
 			});
 			expect(response.status).toBe(200);
-			expect(data.session).toBeDefined();
-			expect(data.user).toBeDefined();
 		});
 
 		it("routePolicy wildcard + false skips verification entirely", async () => {
@@ -563,7 +712,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
@@ -596,7 +745,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
@@ -624,7 +773,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
@@ -652,7 +801,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
@@ -685,22 +834,19 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
-
-			// Create wallet user
-			await post(auth, "/erc8128/verify");
 
 			const headers = {
 				authorization: "ERC-8128 replayable",
 				signature: sig,
 			};
 
-			// Should work before invalidation
+			// Should pass through before invalidation (middleware verifies but doesn't create session)
 			const before = await get(auth, "/get-session", { headers });
-			expect(before.data.session).toBeDefined();
+			expect(before.response.status).toBe(200);
 
 			// Invalidate the specific signature
 			const inv = await post(auth, "/erc8128/invalidate", {
@@ -729,7 +875,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
@@ -758,6 +904,60 @@ describe("erc8128 plugin", () => {
 			const second = await post(auth, "/erc8128/verify");
 			expect(second.response.status).toBe(401);
 		});
+
+		it("rejects class-bound signatures even when non-replayable", async () => {
+			mockVerifier(async () => failResult("not_request_bound"));
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						defaultPolicy: { replayable: true },
+					}),
+				],
+			});
+
+			const { response, data } = await post(auth, "/erc8128/invalidate");
+			expect(response.status).toBe(401);
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "not_request_bound",
+			});
+		});
+
+		it("rejects replayable signatures even when request-bound", async () => {
+			mockVerifier(async () => failResult("replayable_not_allowed"));
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						defaultPolicy: { replayable: true },
+					}),
+				],
+			});
+
+			const { response, data } = await post(auth, "/erc8128/invalidate");
+			expect(response.status).toBe(401);
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "replayable_not_allowed",
+			});
+		});
+
+		it("accepts request-bound non-replayable signatures", async () => {
+			mockVerifier(async () => okResult({ replayable: false }));
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						defaultPolicy: { replayable: true },
+					}),
+				],
+			});
+
+			const { response, data } = await post(auth, "/erc8128/invalidate");
+			expect(response.status).toBe(200);
+			expect(data.success).toBe(true);
+		});
 	});
 
 	describe("replayable signature caching", () => {
@@ -770,12 +970,10 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
-
-			await post(auth, "/erc8128/verify"); // create wallet user
 
 			const headers = {
 				authorization: "ERC-8128 replayable",
@@ -784,9 +982,9 @@ describe("erc8128 plugin", () => {
 			const first = await get(auth, "/get-session", { headers });
 			const second = await get(auth, "/get-session", { headers });
 
-			expect(first.data.session).toBeDefined();
-			expect(second.data.session).toBeDefined();
-			expect(verifySpy).toHaveBeenCalledTimes(2); // one for /verify + one for first /get-session
+			expect(first.response.status).toBe(200);
+			expect(second.response.status).toBe(200);
+			expect(verifySpy).toHaveBeenCalledTimes(1); // only first request triggers full verification; second uses cache
 		});
 
 		it("lazily sweeps expired cache entries on cache access", async () => {
@@ -795,9 +993,6 @@ describe("erc8128 plugin", () => {
 
 			try {
 				const verifySpy = vi.fn(async ({ request }: { request: Request }) => {
-					if (request.url.endsWith("/verify")) {
-						return okResult({ replayable: false });
-					}
 					const now = Math.floor(Date.now() / 1000);
 					return okResult({
 						replayable: true,
@@ -814,12 +1009,10 @@ describe("erc8128 plugin", () => {
 					plugins: [
 						erc8128({
 							verifyMessage: async () => true,
-							allowReplayable: true,
+							defaultPolicy: { replayable: true },
 						}),
 					],
 				});
-
-				await post(auth, "/erc8128/verify");
 
 				await get(auth, "/get-session", {
 					headers: { authorization: "ERC-8128 replayable", signature: "sig-a" },
@@ -846,7 +1039,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						allowReplayable: true,
+						defaultPolicy: { replayable: true },
 					}),
 				],
 			});
