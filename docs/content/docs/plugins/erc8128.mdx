@@ -138,7 +138,7 @@ erc8128({
       replayable: true,
       classBoundPolicies: ["@method", "@path"], // require at least these + @authority
     },
-    "POST /api/orders": { replayable: false },
+    "POST,PUT /api/orders": { replayable: false },
     "GET /api/public/*": false, // skip verification entirely
     default: { replayable: false }, // require auth on all other routes
   },
@@ -148,9 +148,10 @@ erc8128({
 Matching order:
 
 1. Exact match on `"METHOD /path"`.
-2. Wildcard match (`*`).
-3. `default` policy (if set).
-4. No match + no default → opportunistic (passthrough on failure).
+2. Comma-separated methods expand into individual matches — `"POST,PUT /api/orders"` matches both `POST` and `PUT`.
+3. Wildcard match (`*`).
+4. `default` policy (if set).
+5. No match + no default → opportunistic (passthrough on failure).
 
 A value of `false` skips verification. A `VerifyPolicy` object requires verification — returning `401` on failure. Setting `replayable: true` means the server accepts both replayable and non-replayable signatures for that route. `classBoundPolicies` sets the minimum components a class-bound signature must cover.
 

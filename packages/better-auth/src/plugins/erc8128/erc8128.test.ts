@@ -123,7 +123,7 @@ describe("erc8128 plugin", () => {
 
 		const replayable = erc8128({
 			verifyMessage: async () => true,
-			defaultPolicy: { replayable: true },
+			routePolicy: { default: { replayable: true } },
 		});
 		expect(replayable.schema).toEqual(erc8128Schema);
 	});
@@ -369,8 +369,8 @@ describe("erc8128 plugin", () => {
 
 			const { data, response } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 auth",
 					signature: "sig-valid-hook",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(response.status).toBe(200);
@@ -404,8 +404,8 @@ describe("erc8128 plugin", () => {
 			// Signed request to middleware — should auto-create user + wallet (no session)
 			const { data, response } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 first-contact",
 					signature: "sig-first",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(response.status).toBe(200);
@@ -446,16 +446,16 @@ describe("erc8128 plugin", () => {
 			// First signed request — creates user on chain 1
 			await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 chain1",
 					signature: "sig-chain1",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 
 			// Second signed request — same address, different chain
 			await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 chain137",
 					signature: "sig-chain137",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 
@@ -487,8 +487,8 @@ describe("erc8128 plugin", () => {
 			// Middleware can't provide an email, so findOrCreateWalletUser returns null
 			const { data, response } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 anon-off",
 					signature: "sig-anon",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(response.status).toBe(200);
@@ -503,7 +503,7 @@ describe("erc8128 plugin", () => {
 			expect(wallets).toHaveLength(0);
 		});
 
-		it("request without ERC-8128 header passes through without interference", async () => {
+		it("request without signature headers passes through without interference", async () => {
 			mockVerifier(async () => okResult());
 			const { auth } = await getTestInstance({
 				plugins: [erc8128({ verifyMessage: async () => true })],
@@ -516,7 +516,7 @@ describe("erc8128 plugin", () => {
 			).toBe(true);
 		});
 
-		it("invalid ERC-8128 header passes through and falls back to session cookie", async () => {
+		it("invalid signature passes through and falls back to session cookie", async () => {
 			let call = 0;
 			mockVerifier(async () => {
 				call += 1;
@@ -532,8 +532,8 @@ describe("erc8128 plugin", () => {
 			);
 			const { data, response } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 invalid",
 					signature: "bad-sig",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 					cookie,
 				},
 			});
@@ -567,8 +567,8 @@ describe("erc8128 plugin", () => {
 
 			const { response, data } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 invalid",
 					signature: "bad-sig",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(response.status).toBe(401);
@@ -595,8 +595,8 @@ describe("erc8128 plugin", () => {
 			// Valid signature — middleware verifies and allows through (no session created)
 			const { response } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 valid",
 					signature: "sig-ok",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(response.status).toBe(200);
@@ -621,8 +621,8 @@ describe("erc8128 plugin", () => {
 
 			const { response } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 skipped",
 					signature: "sig-skip",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(response.status).toBe(200);
@@ -644,8 +644,8 @@ describe("erc8128 plugin", () => {
 
 			const { response, data } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 required-default",
 					signature: "sig-fail",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(response.status).toBe(401);
@@ -675,8 +675,8 @@ describe("erc8128 plugin", () => {
 			// Request with both cookie and signature headers — session-first should skip verification
 			const { response, data } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 should-be-skipped",
 					signature: "sig-skipped",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 					cookie,
 				},
 			});
@@ -710,8 +710,8 @@ describe("erc8128 plugin", () => {
 			// Request with both cookie and signature headers — should still verify
 			const { response } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 verified-anyway",
 					signature: "sig-verified",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 					cookie,
 				},
 			});
@@ -740,8 +740,8 @@ describe("erc8128 plugin", () => {
 			// Request with cookie + same wallet signature — should pass
 			const { response, data } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 same-user",
 					signature: "sig-same",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 					cookie,
 				},
 			});
@@ -783,8 +783,8 @@ describe("erc8128 plugin", () => {
 			// Request with cookie (defaultAddress user) + signature (otherAddress) — mismatch
 			const { response, data } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 different-user",
 					signature: "sig-different",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 					cookie,
 				},
 			});
@@ -819,8 +819,8 @@ describe("erc8128 plugin", () => {
 			);
 			const { response, data } = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 opportunistic",
 					signature: "sig-bad",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 					cookie,
 				},
 			});
@@ -844,7 +844,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -877,7 +877,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -905,7 +905,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -933,7 +933,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -966,14 +966,14 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
 
 			const headers = {
-				authorization: "ERC-8128 replayable",
 				signature: sig,
+				"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 			};
 
 			// Should pass through before invalidation (middleware verifies but doesn't create session)
@@ -988,7 +988,11 @@ describe("erc8128 plugin", () => {
 
 			// After invalidation, parallel DB check rejects it
 			const after = await get(auth, "/get-session", { headers });
-			expect(after.data === null || after.data.session === null).toBe(true);
+			expect(after.response.status).toBe(401);
+			expect(after.data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "signature_invalidated",
+			});
 		});
 
 		it("per-signature invalidation only affects the caller's own signatures", async () => {
@@ -1021,7 +1025,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -1029,8 +1033,8 @@ describe("erc8128 plugin", () => {
 			// User B's signature works before invalidation attempt
 			const before = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 replayable",
 					signature: userBSig,
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(before.response.status).toBe(200);
@@ -1044,8 +1048,8 @@ describe("erc8128 plugin", () => {
 			// User B's signature should still work — invalidation was by a different keyId
 			const after = await get(auth, "/get-session", {
 				headers: {
-					authorization: "ERC-8128 replayable",
 					signature: userBSig,
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
 			expect(after.response.status).toBe(200);
@@ -1075,7 +1079,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -1111,7 +1115,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -1130,7 +1134,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -1149,7 +1153,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
@@ -1170,14 +1174,14 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});
 
 			const headers = {
-				authorization: "ERC-8128 replayable",
 				signature: "sig-replayable",
+				"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 			};
 			const first = await get(auth, "/get-session", { headers });
 			const second = await get(auth, "/get-session", { headers });
@@ -1209,19 +1213,19 @@ describe("erc8128 plugin", () => {
 					plugins: [
 						erc8128({
 							verifyMessage: async () => true,
-							defaultPolicy: { replayable: true },
+							routePolicy: { default: { replayable: true } },
 						}),
 					],
 				});
 
 				await get(auth, "/get-session", {
-					headers: { authorization: "ERC-8128 replayable", signature: "sig-a" },
+					headers: { signature: "sig-a", "signature-input": 'sig=("@method" "@target-uri" "@authority")' },
 				});
 
 				vi.advanceTimersByTime(61_000);
 
 				await get(auth, "/get-session", {
-					headers: { authorization: "ERC-8128 replayable", signature: "sig-a" },
+					headers: { signature: "sig-a", "signature-input": 'sig=("@method" "@target-uri" "@authority")' },
 				});
 
 				const sigAVerifications = verifySpy.mock.calls.filter(
@@ -1239,7 +1243,7 @@ describe("erc8128 plugin", () => {
 				plugins: [
 					erc8128({
 						verifyMessage: async () => true,
-						defaultPolicy: { replayable: true },
+						routePolicy: { default: { replayable: true } },
 					}),
 				],
 			});

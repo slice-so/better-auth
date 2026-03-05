@@ -69,7 +69,6 @@ declare module "@better-auth/core" {
 
 export interface ERC8128PluginOptions {
 	verifyMessage: VerifyMessageFn;
-	defaultPolicy?: VerifyPolicy | undefined;
 	sessionExpiresIn?: number | undefined;
 	maxValiditySec?: number | undefined;
 	clockSkewSec?: number | undefined;
@@ -135,7 +134,7 @@ const invalidateBodySchema = z
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
 	const replayableEnabled =
-		options.defaultPolicy?.replayable === true ||
+		options.routePolicy?.default?.replayable === true ||
 		(options.routePolicy != null &&
 			Object.values(options.routePolicy).some(
 				(p) => typeof p === "object" && p !== null && p.replayable === true,
@@ -405,11 +404,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							return false;
 						}
 
-						const auth = headers.get("authorization") || "";
-						if (auth.toLowerCase().startsWith("erc-8128 ")) {
-							return true;
-						}
-
 						return !!(
 							headers.get("signature") && headers.get("signature-input")
 						);
@@ -474,15 +468,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							}
 						}
 
-						const authHeader = incomingHeaders.get("authorization") || "";
 						const hasSignatureHeaders =
 							!!incomingHeaders.get("signature") &&
 							!!incomingHeaders.get("signature-input");
 
-						if (
-							!authHeader.toLowerCase().startsWith("erc-8128 ") &&
-							!hasSignatureHeaders
-						) {
+						if (!hasSignatureHeaders) {
 							if (!resolvedRoutePolicy.requireAuth) {
 								return;
 							}
@@ -507,11 +497,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							verifyMessage: options.verifyMessage,
 							nonceStore: getNonceStore(ctx),
 							defaults: {
-								...options.defaultPolicy,
+								...options.routePolicy?.default,
 								maxValiditySec: options.maxValiditySec,
 								clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
 								maxSignatureVerifications: MAX_SIGNATURE_VERIFICATIONS,
-								replayable: options.defaultPolicy?.replayable ?? false,
+								replayable: options.routePolicy?.default?.replayable ?? false,
 								...(replayableEnabled
 									? {
 											replayableNotBefore: async (keyid: string) => {
@@ -535,7 +525,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						// Check replayable signature cache before full verification
 						let result: VerifyResult | null = null;
 						const cache = getCache(ctx);
-						if (signature && replayableEnabled && !resolvedRoutePolicy.policy) {
+						if (signature && replayableEnabled) {
 							cache.sweep();
 
 							const cached = await cache.get(signature);
