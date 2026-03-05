@@ -142,9 +142,13 @@ describe("erc8128 plugin", () => {
 
 			const { response, data } = await get(auth, "/.well-known/erc8128");
 			expect(response.status).toBe(200);
-			expect(data).toEqual({
+			expect(data).toMatchObject({
 				verification_endpoint: "http://localhost:3000/api/auth/erc8128/verify",
 				max_validity_sec: 120,
+				capabilities: {
+					persistent_storage: true,
+					request_bound_middleware_only: false,
+				},
 			});
 			expect(data.invalidation_endpoint).toBeUndefined();
 		});

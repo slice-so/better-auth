@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	createAdapterNonceStore,
 	createDualNonceStore,
+	createMemoryNonceStore,
 	createSecondaryStorageNonceStore,
 } from "./nonce-store";
 
@@ -156,6 +157,27 @@ describe("secondaryStorage nonce store", () => {
 
 		const nonceStore = createSecondaryStorageNonceStore(storage);
 		expect(await nonceStore.consume("err-nonce", 60)).toBe(false);
+	});
+});
+
+describe("memory nonce store", () => {
+	it("consumes nonce only once", async () => {
+		const store = createMemoryNonceStore();
+		expect(await store.consume("mem-nonce", 60)).toBe(true);
+		expect(await store.consume("mem-nonce", 60)).toBe(false);
+	});
+
+	it("allows nonce reuse after ttl expiry", async () => {
+		vi.useFakeTimers();
+		try {
+			const store = createMemoryNonceStore();
+			expect(await store.consume("mem-ttl", 1)).toBe(true);
+			expect(await store.consume("mem-ttl", 1)).toBe(false);
+			vi.advanceTimersByTime(1100);
+			expect(await store.consume("mem-ttl", 1)).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 

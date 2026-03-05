@@ -5,7 +5,15 @@ description: Authenticate requests with Ethereum accounts using HTTP Message Sig
 
 [ERC-8128](https://erc8128.org) is a signature-based authentication standard built on [RFC 9421 (HTTP Message Signatures)](https://www.rfc-editor.org/rfc/rfc9421). The client signs each request with an Ethereum account, binding identity and intent to every request, and the server verifies it cryptographically. Signatures are controlled by the client and can be request-bound or class-bound, with or without replay protection, while the server always accepts the strongest security posture (non-replayable, request-bound). Since no credential exchange or login is needed, authentication is zero-round-trip by design and the same flow works for humans, backend services, and AI agents.
 
-This plugin integrates ERC-8128 into Better Auth with two modes: **session-based authentication** (sign once via `/erc8128/verify`, get a session, use cookies normally) and **per-request authentication** where every call is individually signed. Better Auth handles the required server-side state — nonce tracking, signature invalidation, and verification caching — adding cryptographic request signing to your application with minimal operational complexity.
+This plugin integrates ERC-8128 into Better Auth with two modes: **session-based authentication** (sign once via `/erc8128/verify`, get a session, use cookies normally) and **per-request authentication** where every call is individually signed.
+
+## Quick Start (Recommended)
+
+For production, use **secondaryStorage** (for example Redis) and keep `storeInDatabase: false` (default). This gives shared nonce tracking/invalidation/caching with the best runtime performance.
+
+If persistent audit/recovery in SQL is required, set `storeInDatabase: true` to dual-write nonce and invalidation records (higher write cost).
+
+If no persistent storage is available, the plugin falls back to **request-bound middleware verification only** for explicitly protected routes; persistence-dependent endpoints are disabled. If a protected route policy requires `replayable: true`, verification fails with `replayable_requires_storage` until DB or secondaryStorage is configured.
 
 ## Installation
 
@@ -264,11 +272,12 @@ erc8128({
 
 This follows the same pattern as Better Auth's [`session.storeSessionInDatabase`](/docs/concepts/session-management#sessions-in-secondary-storage).
 
-| `secondaryStorage` | `storeInDatabase` | Nonce | Invalidation | Cache |
-| --- | --- | --- | --- | --- |
-| Not configured | — | Database | Database | Database + in-memory |
-| Configured | `false` (default) | secondaryStorage | secondaryStorage | secondaryStorage |
-| Configured | `true` | Database + secondaryStorage | Database + secondaryStorage | secondaryStorage |
+| `secondaryStorage` | `storeInDatabase` | Nonce | Invalidation | Cache | Endpoint availability |
+| --- | --- | --- | --- | --- | --- |
+| Not configured, DB available | `false` | Database | Database | Database + in-memory | Full (`/verify`, `/invalidate` when replayable) |
+| Configured | `false` (default) | secondaryStorage | secondaryStorage | secondaryStorage | Full |
+| Configured | `true` | Database + secondaryStorage | Database + secondaryStorage | secondaryStorage | Full |
+| No DB and no secondaryStorage | `false` | In-memory (process-local) | Disabled | In-memory only | `/.well-known` only (+ request-bound middleware for explicit route policies) |
 
 <Callout>
 For production deployments with multiple server instances, configure `secondaryStorage` (e.g. Redis) so nonce tracking, invalidation, and verification caching are shared across all instances.
@@ -315,8 +324,8 @@ For production deployments with multiple server instances, configure `secondaryS
 | Method | Path | Description |
 | --- | --- | --- |
 | `POST` | `/erc8128/verify` | Verify a signed request, create/link user, start session. |
-| `POST` | `/erc8128/invalidate` | Invalidate replayable signatures. Available when any route policy allows replayable. |
-| `GET` | `/.well-known/erc8128` | Discovery metadata (algorithms, policies, endpoints). |
+| `POST` | `/erc8128/invalidate` | Invalidate replayable signatures. Available when any route policy allows replayable and persistent storage is available. |
+| `GET` | `/.well-known/erc8128` | Discovery metadata (algorithms, policies, endpoints, capabilities). |
 
 ## Schema
 

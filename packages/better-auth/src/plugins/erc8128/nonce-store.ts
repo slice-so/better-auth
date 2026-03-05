@@ -68,6 +68,36 @@ export function createDualNonceStore(
 	};
 }
 
+export function createMemoryNonceStore(): NonceStore {
+	const fallback = new Map<string, number>();
+
+	const consumeFromFallback = (
+		identifier: string,
+		ttlSeconds: number,
+	): boolean => {
+		const now = Date.now();
+		for (const [key, expiresAt] of fallback) {
+			if (expiresAt <= now) {
+				fallback.delete(key);
+			}
+		}
+
+		const existing = fallback.get(identifier);
+		if (existing && existing > now) {
+			return false;
+		}
+
+		fallback.set(identifier, now + ttlSeconds * 1000);
+		return true;
+	};
+
+	return {
+		async consume(key: string, ttlSeconds: number): Promise<boolean> {
+			return consumeFromFallback(`${NONCE_KEY_PREFIX}${key}`, ttlSeconds);
+		},
+	};
+}
+
 export function createAdapterNonceStore(
 	adapter: VerificationAdapter,
 ): NonceStore {

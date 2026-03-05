@@ -232,6 +232,77 @@ export function createSecondaryStorageInvalidationOps(
 }
 
 // ---------------------------------------------------------------------------
+// In-memory implementation (stateless fallback)
+// ---------------------------------------------------------------------------
+
+export function createMemoryInvalidationOps(
+	defaultTtlSec: number = DEFAULT_INVALIDATION_TTL_SEC,
+): InvalidationOps {
+	const keyIdStore = new Map<string, { notBefore: number; expiresAt: number }>();
+	const sigStore = new Map<string, { record: InvalidationRecord; expiresAt: number }>();
+
+	const sweep = () => {
+		const nowSec = Math.floor(Date.now() / 1000);
+		for (const [k, v] of keyIdStore) {
+			if (v.expiresAt <= nowSec) keyIdStore.delete(k);
+		}
+		for (const [k, v] of sigStore) {
+			if (v.expiresAt <= nowSec) sigStore.delete(k);
+		}
+	};
+
+	return {
+		async findByKeyId(keyId: string): Promise<InvalidationRecord[]> {
+			sweep();
+			const row = keyIdStore.get(keyId.toLowerCase());
+			if (!row) return [];
+			return [{ notBefore: row.notBefore }];
+		},
+
+		async findBySignature(signature: string): Promise<InvalidationRecord | null> {
+			sweep();
+			const row = sigStore.get(signature);
+			return row?.record ?? null;
+		},
+
+		async upsertKeyIdNotBefore(
+			keyId: string,
+			notBefore: number,
+			ttlSec?: number,
+		): Promise<void> {
+			sweep();
+			const ttl = ttlSec ?? defaultTtlSec;
+			keyIdStore.set(keyId.toLowerCase(), {
+				notBefore,
+				expiresAt: Math.floor(Date.now() / 1000) + ttl,
+			});
+		},
+
+		async upsertSignatureInvalidation(
+			keyId: string,
+			signature: string,
+			ttlSec: number,
+		): Promise<void> {
+			sweep();
+			sigStore.set(signature, {
+				record: {
+					signature,
+					notBefore: 0,
+				},
+				expiresAt: Math.floor(Date.now() / 1000) + ttlSec,
+			});
+			// Keep per-keyId invalidation alive as well in memory mode if set later
+			if (!keyIdStore.has(keyId.toLowerCase())) {
+				keyIdStore.set(keyId.toLowerCase(), {
+					notBefore: 0,
+					expiresAt: Math.floor(Date.now() / 1000) + defaultTtlSec,
+				});
+			}
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Dual-write implementation (DB + secondaryStorage)
 // ---------------------------------------------------------------------------
 

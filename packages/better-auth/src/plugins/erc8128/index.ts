@@ -27,12 +27,14 @@ import type { InvalidationOps } from "./invalidation-store";
 import {
 	createDBInvalidationOps,
 	createDualInvalidationOps,
+	createMemoryInvalidationOps,
 	createSecondaryStorageInvalidationOps,
 	DEFAULT_INVALIDATION_TTL_SEC,
 } from "./invalidation-store";
 import {
 	createAdapterNonceStore,
 	createDualNonceStore,
+	createMemoryNonceStore,
 	createSecondaryStorageNonceStore,
 } from "./nonce-store";
 import { isPluginEndpoint, resolveRoutePolicy } from "./route-policy";
@@ -143,28 +145,49 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 	const maxCacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
 	let cacheOps: VerificationCacheOps | null = null;
 	let invalidationOpsInstance: InvalidationOps | null = null;
-	let nonceStoreInstance: ReturnType<typeof createAdapterNonceStore> | null =
-		null;
+	let nonceStoreInstance:
+		| {
+				consume: (key: string, ttlSeconds: number) => Promise<boolean>;
+		  }
+		| null = null;
+	let storageMode: "secondary-storage" | "database" | "none" | null = null;
+	let warnedNoStorage = false;
+	let warnedReplayableNoStorage = false;
 
-	const getNonceStore = (ctx: GenericEndpointContext) => {
-		if (!nonceStoreInstance) {
-			if (ctx.context.secondaryStorage) {
-				const ssStore = createSecondaryStorageNonceStore(
-					ctx.context.secondaryStorage,
-				);
-				nonceStoreInstance = options.storeInDatabase
-					? createDualNonceStore(
-							createAdapterNonceStore(ctx.context.internalAdapter),
-							ssStore,
-						)
-					: ssStore;
-			} else {
-				nonceStoreInstance = createAdapterNonceStore(
-					ctx.context.internalAdapter,
-				);
-			}
+	const warnNoStorage = () => {
+		if (warnedNoStorage) return;
+		warnedNoStorage = true;
+		console.warn(
+			"[better-auth][erc8128] No persistent storage available (DB/secondaryStorage). " +
+				"Falling back to request-bound middleware verification only for explicit routePolicy routes. " +
+				"Endpoints requiring persistence (/erc8128/verify, /erc8128/invalidate) are disabled.",
+		);
+	};
+
+	const warnReplayableNoStorage = () => {
+		if (warnedReplayableNoStorage) return;
+		warnedReplayableNoStorage = true;
+		console.warn(
+			"[better-auth][erc8128] Replayable route policy requested without persistent storage. " +
+				"Replayable signatures require DB or secondaryStorage; protected replayable routes will fail.",
+		);
+	};
+
+	const ensureStorageMode = async (ctx: GenericEndpointContext) => {
+		if (storageMode) return storageMode;
+		if (ctx.context.secondaryStorage) {
+			storageMode = "secondary-storage";
+			return storageMode;
 		}
-		return nonceStoreInstance;
+		try {
+			await ctx.context.internalAdapter.findVerificationValue("__erc8128_probe__");
+			storageMode = "database";
+			return storageMode;
+		} catch {
+			storageMode = "none";
+			warnNoStorage();
+			return storageMode;
+		}
 	};
 
 	const getCache = (ctx: GenericEndpointContext): VerificationCacheOps => {
@@ -186,11 +209,18 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 	const getInvalidationOps = (ctx: GenericEndpointContext): InvalidationOps => {
 		if (!invalidationOpsInstance) {
+			if (storageMode === "none") {
+				invalidationOpsInstance = createMemoryInvalidationOps(
+					Math.max(
+						(options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC) * 2,
+						DEFAULT_INVALIDATION_TTL_SEC,
+					),
+				);
+				return invalidationOpsInstance;
+			}
 			const dbOps = createDBInvalidationOps(ctx.context.adapter);
 			if (ctx.context.secondaryStorage) {
 				const maxTtl = options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC;
-				// Default TTL for invalidation records: generous upper bound
-				// so records outlive any signature they could invalidate
 				const invalidationTtl = Math.max(
 					maxTtl * 2,
 					DEFAULT_INVALIDATION_TTL_SEC,
@@ -207,6 +237,27 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			}
 		}
 		return invalidationOpsInstance;
+	};
+
+	const getNonceStore = (ctx: GenericEndpointContext) => {
+		if (!nonceStoreInstance) {
+			if (storageMode === "none") {
+				nonceStoreInstance = createMemoryNonceStore();
+			} else if (ctx.context.secondaryStorage) {
+				const ssStore = createSecondaryStorageNonceStore(
+					ctx.context.secondaryStorage,
+				);
+				nonceStoreInstance = options.storeInDatabase
+					? createDualNonceStore(
+							createAdapterNonceStore(ctx.context.internalAdapter),
+							ssStore,
+						)
+					: ssStore;
+			} else {
+				nonceStoreInstance = createAdapterNonceStore(ctx.context.internalAdapter);
+			}
+		}
+		return nonceStoreInstance;
 	};
 
 	const findOrCreateWalletUser = async (
@@ -396,6 +447,29 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								} as const);
 						if (resolvedRoutePolicy.skipVerification) {
 							return;
+						}
+
+						await ensureStorageMode(ctx);
+						if (storageMode === "none") {
+							if (!resolvedRoutePolicy.requireAuth) {
+								// In stateless mode, only explicitly protected routes run middleware.
+								return;
+							}
+							if (resolvedRoutePolicy.policy?.replayable) {
+								warnReplayableNoStorage();
+								return new Response(
+									JSON.stringify({
+										error: "erc8128_verification_failed",
+										reason: "replayable_requires_storage",
+										detail:
+											"Replayable route policy requires database or secondaryStorage",
+									}),
+									{
+										status: 401,
+										headers: { "Content-Type": "application/json" },
+									},
+								);
+							}
 						}
 
 						const authHeader = incomingHeaders.get("authorization") || "";
@@ -661,18 +735,27 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					metadata: HIDE_METADATA,
 				},
 				async (ctx) => {
+					await ensureStorageMode(ctx);
 					const baseURL = ctx.context.baseURL;
 
-					return ctx.json(
-						formatDiscoveryDocument({
-							verificationEndpoint: `${baseURL}/erc8128/verify`,
-							invalidationEndpoint: replayableEnabled
-								? `${baseURL}/erc8128/invalidate`
-								: undefined,
+					return ctx.json({
+						...formatDiscoveryDocument({
+							verificationEndpoint:
+								storageMode === "none"
+									? undefined
+									: `${baseURL}/erc8128/verify`,
+							invalidationEndpoint:
+								replayableEnabled && storageMode !== "none"
+									? `${baseURL}/erc8128/invalidate`
+									: undefined,
 							maxValiditySec: options.maxValiditySec,
 							routePolicy: options.routePolicy,
 						}),
-					);
+						capabilities: {
+							persistent_storage: storageMode !== "none",
+							request_bound_middleware_only: storageMode === "none",
+						},
+					});
 				},
 			),
 			verifyErc8128: createAuthEndpoint(
@@ -683,6 +766,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					requireRequest: true,
 				},
 				async (ctx) => {
+					await ensureStorageMode(ctx);
+					if (storageMode === "none") {
+						return new Response(null, { status: 404 });
+					}
 					// Verify endpoint requires request-bound, non-replayable signatures
 					// (replayable/class-bound flexibility is for the middleware only)
 					const verifier = createVerifierClient({
@@ -799,6 +886,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								requireRequest: true,
 							},
 							async (ctx) => {
+								await ensureStorageMode(ctx);
+								if (storageMode === "none") {
+									return new Response(null, { status: 404 });
+								}
 								const verifier = createVerifierClient({
 									verifyMessage: options.verifyMessage,
 									nonceStore: getNonceStore(ctx),
