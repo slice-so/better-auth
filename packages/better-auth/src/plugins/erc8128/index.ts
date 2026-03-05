@@ -145,11 +145,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 	const maxCacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
 	let cacheOps: VerificationCacheOps | null = null;
 	let invalidationOpsInstance: InvalidationOps | null = null;
-	let nonceStoreInstance:
-		| {
-				consume: (key: string, ttlSeconds: number) => Promise<boolean>;
-		  }
-		| null = null;
+	let nonceStoreInstance: {
+		consume: (key: string, ttlSeconds: number) => Promise<boolean>;
+	} | null = null;
 	let storageMode: "secondary-storage" | "database" | "none" | null = null;
 	let warnedNoStorage = false;
 	let warnedReplayableNoStorage = false;
@@ -169,7 +167,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 		warnedReplayableNoStorage = true;
 		console.warn(
 			"[better-auth][erc8128] Replayable route policy requested without persistent storage. " +
-				"Replayable signatures require DB or secondaryStorage; protected replayable routes will fail.",
+				"Replayable signatures require DB or secondaryStorage. Protected replayable routes will fail.",
 		);
 	};
 
@@ -180,7 +178,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			return storageMode;
 		}
 		try {
-			await ctx.context.internalAdapter.findVerificationValue("__erc8128_probe__");
+			await ctx.context.internalAdapter.findVerificationValue(
+				"__erc8128_probe__",
+			);
 			storageMode = "database";
 			return storageMode;
 		} catch {
@@ -254,7 +254,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						)
 					: ssStore;
 			} else {
-				nonceStoreInstance = createAdapterNonceStore(ctx.context.internalAdapter);
+				nonceStoreInstance = createAdapterNonceStore(
+					ctx.context.internalAdapter,
+				);
 			}
 		}
 		return nonceStoreInstance;
