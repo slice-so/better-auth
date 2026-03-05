@@ -7,6 +7,7 @@ const INV_KEY_PREFIX = "erc8128:inv:keyid:";
 const INV_SIG_PREFIX = "erc8128:inv:sig:";
 
 export interface InvalidationRecord {
+	keyId?: string;
 	signature?: string;
 	notBefore: number;
 }
@@ -59,6 +60,7 @@ function toInvalidationRecord(
 	row: Record<string, unknown>,
 ): InvalidationRecord {
 	return {
+		keyId: typeof row.keyId === "string" ? row.keyId : undefined,
 		signature: typeof row.signature === "string" ? row.signature : undefined,
 		notBefore: typeof row.notBefore === "number" ? row.notBefore : 0,
 	};

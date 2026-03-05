@@ -3,20 +3,9 @@ title: ERC-8128
 description: Authenticate requests with Ethereum accounts using HTTP Message Signatures
 ---
 
-[ERC-8128](https://erc8128.org) is a signature-based authentication standard built on [RFC 9421 (HTTP Message Signatures)](https://www.rfc-editor.org/rfc/rfc9421). The client signs each request with an Ethereum account and the server verifies it cryptographically, binding identity and intent to every request. Signatures can be request-bound or class-bound, with or without replay protection — controlled by the client, while the server always accepts the strongest posture (non-replayable, request-bound). Since no credential exchange or login is needed, authentication is zero-round-trip by design and the same flow works for browser users, backend services, and AI agents.
+[ERC-8128](https://erc8128.org) is a signature-based authentication standard built on [RFC 9421 (HTTP Message Signatures)](https://www.rfc-editor.org/rfc/rfc9421). The client signs each request with an Ethereum account, binding identity and intent to every request, and the server verifies it cryptographically. Signatures are controlled by the client and can be request-bound or class-bound, with or without replay protection, while the server always accepts the strongest security posture (non-replayable, request-bound). Since no credential exchange or login is needed, authentication is zero-round-trip by design and the same flow works for humans, backend services, and AI agents.
 
 This plugin integrates ERC-8128 into Better Auth with two modes: **session-based authentication** (sign once via `/erc8128/verify`, get a session, use cookies normally) and **per-request authentication** where every call is individually signed. Better Auth handles the required server-side state — nonce tracking, signature invalidation, and verification caching — adding cryptographic request signing to your application with minimal operational complexity.
-
-## Why ERC-8128?
-
-Session-based wallet authentication (sign a challenge, get a cookie) protects the login step but not what follows — every subsequent request travels with a bearer token that can be stolen, replayed, or misrouted. ERC-8128 signs **every request** individually, binding the signature to the HTTP method, path, headers, and body:
-
-- **Request integrity** — each call is independently authenticated and tamper-evident.
-- **No bearer credentials** — nothing to leak, rotate, or revoke.
-- **Replay protection** — built-in nonces prevent captured requests from being reused.
-- **Stateless option** — works without sessions, cookies, or server-side state.
-
-This makes ERC-8128 the natural authentication layer for **autonomous agents and machine-to-machine calls**. An agent with an Ethereum key can authenticate with any ERC-8128-enabled endpoint — no API key provisioning, no OAuth flows, no manual setup. Enabling ERC-8128 on your server makes it instantly accessible to the entire ecosystem of onchain agents.
 
 ## Installation
 
@@ -123,9 +112,15 @@ When any request to `auth.handler` carries ERC-8128 signature headers (`Signatur
   The middleware only runs for requests routed through `auth.handler`. For custom routes outside Better Auth, use `verifyRequest()` from `@slicekit/erc8128` directly.
 </Callout>
 
+## Signing Model
+
+The signer always controls the security posture of each signature — whether it includes a nonce (non-replayable) or omits it (replayable), and whether it covers the full request (request-bound) or only selected components like method and path (class-bound).
+
+The server controls what it *accepts*: `routePolicy` declares which routes allow replayable or class-bound signatures. The server always accepts a stronger posture than required — a non-replayable, request-bound signature is valid everywhere.
+
 ## Route Policy
 
-Use `routePolicy` to control per-route verification behavior in middleware.
+Use `routePolicy` to declare which routes require authentication and what signature postures the server accepts.
 
 ```ts title="auth.ts"
 erc8128({
@@ -149,7 +144,7 @@ Matching order:
 3. `default` policy (if set).
 4. No match + no default → opportunistic (passthrough on failure).
 
-A value of `false` skips verification. A `VerifyPolicy` object requires verification — returning `401` on failure.
+A value of `false` skips verification. A `VerifyPolicy` object requires verification — returning `401` on failure. Setting `replayable: true` means the server accepts both replayable and non-replayable signatures for that route. `classBoundPolicies` sets the minimum components a class-bound signature must cover.
 
 <Callout>
   Both `/erc8128/verify` and `/erc8128/invalidate` enforce non-replayable, request-bound signatures — this is not configurable.
@@ -157,35 +152,16 @@ A value of `false` skips verification. A `VerifyPolicy` object requires verifica
 
 ## Replayable Signatures
 
-By default, every signature includes a nonce and can only be used once. For short-lived automation or backend-to-backend calls where re-signing each request is impractical, routes can opt into replayable signatures via `routePolicy`.
+By default, the client signs every request with a nonce — making each signature single-use. For automation or backend-to-backend calls where re-signing is impractical, the signer can omit the nonce to produce a replayable signature. The server must explicitly allow this per-route via `routePolicy` (`replayable: true`); routes that don't opt in will reject replayable signatures.
 
-When any route allows replayable signatures, the plugin automatically enables:
+When any route policy allows replayable signatures, the plugin automatically enables:
 
 - The `/erc8128/invalidate` endpoint for revoking signatures.
-- Server-side verification caching so repeated use of the same signature skips expensive re-verification.
-
-```ts title="auth.ts"
-erc8128({
-  verifyMessage: publicClient.verifyMessage,
-  routePolicy: {
-    "GET /api/products/*": {
-      replayable: true,
-      classBoundPolicies: ["@method", "@path"],
-    },
-    "POST /api/orders": { replayable: false },
-    "GET /api/public/*": false,
-    default: { replayable: false },
-  },
-});
-```
-
-<Callout>
-  The `/erc8128/verify` and `/erc8128/invalidate` endpoints always require request-bound, non-replayable signatures regardless of route policy.
-</Callout>
+- Server-side verification caching so repeated use of the same signature skips re-verification.
 
 ### Invalidation
 
-Previously issued replayable signatures can be revoked via a signed `POST` to `/erc8128/invalidate`. Two modes are supported (one per request):
+Replayable signatures can be revoked via a signed `POST` to `/erc8128/invalidate`. Two modes are supported (one per request):
 
 - **Per-signature** — revoke a single signature by its hex value.
 - **`notBefore` timestamp** — reject all signatures created before a given time for the caller's key.
@@ -202,25 +178,25 @@ erc8128Client({
 })
 ```
 
-On initialization, the client fetches `GET /.well-known/erc8128` to learn the server's replay and route policy configuration. By default, all requests use **non-replayable, request-bound** signatures regardless of server config. To opt into replayable class-bound signing when the server allows it, set `preferReplayable` and `components` — see [Signing Posture](#signing-posture).
+On initialization, the client fetches `GET /.well-known/erc8128` to learn the server's route policies. By default, all requests use **non-replayable, request-bound** signatures — the strongest posture. Use `preferReplayable`, `binding`, and `components` to opt into weaker postures when appropriate — see [Signing Posture](#signing-posture).
 
 ### Signing Posture
 
-The client controls its own signing posture via `preferReplayable` and `components`. These map to `@slicekit/erc8128`'s `SignerClientOptions` — the plugin forwards all non-managed fields (`ttlSeconds`, `label`, `contentDigest`, etc.) to `signRequest` automatically.
+The client controls its signing posture through three independent parameters. The plugin forwards all other `@slicekit/erc8128` options (`ttlSeconds`, `label`, `contentDigest`, etc.) to `signRequest` automatically. See the [ERC-8128 documentation](https://erc8128.slice.so) for full concept explanations.
 
-| `preferReplayable` | `components` | Behavior |
-| --- | --- | --- |
-| `false` (default) | *ignored* | Always request-bound, with nonce. |
-| `true` | `undefined` (default) | Replayable + request-bound when server allows. Not cached. |
-| `true` | `[]` | Replayable + class-bound with `@authority` only. Cached. |
-| `true` | `["@method", "@path"]` | Replayable + class-bound with at least these + `@authority`. Cached. |
+**`preferReplayable`** controls whether signatures include a nonce. When `false` (default), every signature is non-replayable — single-use. When `true`, the client omits the nonce to produce replayable signatures on routes where the server's `routePolicy` allows it. Routes that don't allow replayable signatures still get non-replayable ones.
 
-When `components` is set, the client merges it with the route's `classBoundPolicies` from the server config — the signed components are always the union of both sets.
+**`binding`** controls what the signature covers. `"request-bound"` (default) covers the full request. `"class-bound"` covers only selected components — useful for reusing the same signature across multiple requests that share those components.
 
-```ts title="Backend agent — class-bound with minimum components"
+**`components`** specifies which derived components to include. Its meaning depends on `binding`: when request-bound, these are *additional* components beyond the defaults. When class-bound, these are the *minimum* components the signature must cover (plus `@authority`, which is always included).
+
+The client automatically merges the signer's preferences with the server's requirements (from `/.well-known/erc8128`) to produce the most appropriate signature for each route.
+
+```ts title="Backend agent — class-bound replayable with minimum components"
 erc8128Client({
   signer: agentSigner,
   preferReplayable: true,
+  binding: "class-bound",
   components: ["@method"],
   storage: sigCache,
 })
@@ -228,23 +204,17 @@ erc8128Client({
 
 ### Signature Caching
 
-When `preferReplayable` is `true` and `components` is set (even to `[]`), the client caches class-bound signatures and reuses them across requests — avoiding a cryptographic signing operation on every call.
+When a signature is both class-bound and replayable, the client caches it and reuses it across requests — avoiding a cryptographic signing operation on every call.
 
-Caching is controlled by the `storage` option:
-
-| Value | Behavior |
-| --- | --- |
-| `"localStorage"` | Browser `localStorage` adapter (default when `localStorage` is available). |
-| `Erc8128SignatureStore` object | Custom async-capable store — use for Node.js backends (Redis, database, in-memory Map). |
-| `false` | Disable caching entirely. |
-
-When omitted, `localStorage` is used if available, otherwise caching is disabled.
+Caching is controlled by the `storage` option: `"localStorage"` uses the browser adapter (default when available), an `Erc8128SignatureStore` object provides a custom async-capable store for Node.js backends (Redis, database, in-memory Map), and `false` disables caching entirely.
 
 ```ts title="Node.js backend with custom store"
 const sigCache = new Map();
 
 erc8128Client({
   signer: myAgentSigner,
+  binding: "class-bound",
+  preferReplayable: true,
   storage: {
     get: (keyId) => sigCache.get(keyId) ?? null,
     set: (keyId, entries) => sigCache.set(keyId, entries),
@@ -253,22 +223,7 @@ erc8128Client({
 })
 ```
 
-Each keyId maps to an **array** of cached signatures — different routes may require different class-bound components, so multiple valid entries can coexist until they expire. The `Erc8128SignatureStore` interface methods can return promises for async backends:
-
-```ts
-interface Erc8128SignatureStore {
-  get(keyId: string): CachedSignature[] | null | Promise<CachedSignature[] | null>;
-  set(keyId: string, entries: CachedSignature[]): void | Promise<void>;
-  delete(keyId: string): void | Promise<void>;
-}
-```
-
-A cached signature is reused only when:
-
-1. It has not expired (with a configurable safety margin — `expiryMarginSec`, default 10s).
-2. Its signed components satisfy the target route's `classBoundPolicies` from the server config.
-
-When no cached entry covers the components required by a route, the client signs fresh and **appends** the new signature to the store alongside the existing entries. Expired entries are pruned automatically on each cache access. The `clearSignatureCache()` action removes all entries for the current signer.
+Each keyId maps to an array of cached signatures — different routes may require different class-bound components, so multiple valid entries coexist until they expire. Expired entries are pruned automatically on each cache access. The `clearSignatureCache()` action removes all entries for the current signer.
 
 ## Error Handling
 
@@ -344,13 +299,16 @@ For production deployments with multiple server instances, configure `secondaryS
 | --- | --- | --- | --- |
 | `signer` | `EthHttpSigner \| () => EthHttpSigner \| null` | — | Wallet signer for auto-signing. Without this, the plugin is type-only. |
 | `preferReplayable` | `boolean` | `false` | Whether to prefer replayable signatures when the server allows it — see [Signing Posture](#signing-posture). |
-| `components` | `string[]` | — | Minimum class-bound components. `undefined` = request-bound only; `[]` = class-bound with `@authority`; `["@method"]` = at least `@authority` + `@method`. |
+| `binding` | `"request-bound" \| "class-bound"` | `"request-bound"` | What the signature covers — see [Signing Posture](#signing-posture). |
+| `components` | `string[]` | — | When request-bound, additional components beyond the defaults. When class-bound, minimum components (plus `@authority`). Merged with the server's route policy. |
 | `storage` | `"localStorage" \| Erc8128SignatureStore \| false` | auto | Where to cache replayable signatures — see [Signature Caching](#signature-caching). |
 | `storagePrefix` | `string` | `"erc8128"` | Key prefix for the built-in `localStorage` adapter. |
 | `expiryMarginSec` | `number` | `10` | Seconds before expiry to consider a cached signature stale. |
 | `ttlSeconds` | `number` | — | Signature TTL in seconds. Forwarded to `signRequest`. |
 | `label` | `string` | — | Signature label. Forwarded to `signRequest`. |
 | `contentDigest` | `"auto" \| "recompute" \| "require" \| "off"` | — | Content-Digest handling mode. Forwarded to `signRequest`. |
+| `expires` | `number` | — | Explicit expiration timestamp (unix seconds). Overrides `ttlSeconds`. Forwarded to `signRequest`. |
+| `nonce` | `string \| () => Promise<string>` | — | Custom nonce value or async generator. Forwarded to `signRequest`. |
 
 ## Endpoints
 

@@ -987,6 +987,74 @@ describe("erc8128 plugin", () => {
 			expect(after.data === null || after.data.session === null).toBe(true);
 		});
 
+		it("per-signature invalidation only affects the caller's own signatures", async () => {
+			const userAAddress =
+				"0x000000000000000000000000000000000000aaaa" as const;
+			const userBAddress =
+				"0x000000000000000000000000000000000000bbbb" as const;
+			const userAKeyId = formatKeyId(defaultChainId, userAAddress);
+			const userBKeyId = formatKeyId(defaultChainId, userBAddress);
+			const userBSig = "0xuserbsignature";
+
+			mockVerifier(async ({ request }) => {
+				// User A calls /invalidate trying to invalidate User B's signature
+				if (request.url.endsWith("/invalidate")) {
+					return okResult({
+						address: userAAddress,
+						keyId: userAKeyId,
+						replayable: false,
+					});
+				}
+				// User B's replayable signature in middleware
+				return okResult({
+					address: userBAddress,
+					keyId: userBKeyId,
+					replayable: true,
+				});
+			});
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						defaultPolicy: { replayable: true },
+					}),
+				],
+			});
+
+			// User B's signature works before invalidation attempt
+			const before = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 replayable",
+					signature: userBSig,
+				},
+			});
+			expect(before.response.status).toBe(200);
+
+			// User A tries to invalidate User B's signature
+			const inv = await post(auth, "/erc8128/invalidate", {
+				body: { signature: userBSig },
+			});
+			expect(inv.data.success).toBe(true);
+
+			// User B's signature should still work — invalidation was by a different keyId
+			const after = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 replayable",
+					signature: userBSig,
+				},
+			});
+			expect(after.response.status).toBe(200);
+
+			// Verify User B's wallet was still created (middleware passed through)
+			const ctx = await auth.$context;
+			const wallets = await ctx.adapter.findMany<WalletAddress>({
+				model: "walletAddress",
+				where: [{ field: "address", operator: "eq", value: userBAddress }],
+			});
+			expect(wallets).toHaveLength(1);
+		});
+
 		it("after invalidation, old replayable signatures are rejected", async () => {
 			const keyId = formatKeyId(defaultChainId, defaultAddress);
 			const now = Math.floor(Date.now() / 1000);

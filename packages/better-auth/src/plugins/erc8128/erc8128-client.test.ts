@@ -92,13 +92,17 @@ function mockSignRequestFn(opts?: {
 	});
 }
 
+/** The mock `setServerConfig` from the last `setupMockSignerClient` call. */
+let mockSetServerConfig: ReturnType<typeof vi.fn>;
+
 function setupMockSignerClient(signFn?: ReturnType<typeof mockSignRequestFn>) {
 	const fn = signFn ?? mockSignRequestFn();
+	mockSetServerConfig = vi.fn();
 	vi.mocked(createSignerClient).mockReturnValue({
 		signRequest: fn,
 		signedFetch: vi.fn(),
 		fetch: vi.fn(),
-		setServerConfig: vi.fn(),
+		setServerConfig: mockSetServerConfig,
 	} as unknown as SignerClient);
 	return fn;
 }
@@ -110,6 +114,7 @@ async function setupPluginWithConfig(opts: {
 	signFn?: ReturnType<typeof mockSignRequestFn>;
 	expiryMarginSec?: number;
 	preferReplayable?: boolean;
+	binding?: "request-bound" | "class-bound";
 	components?: string[];
 	ttlSeconds?: number;
 	label?: string;
@@ -121,6 +126,7 @@ async function setupPluginWithConfig(opts: {
 		storage: opts.storage === undefined ? false : opts.storage,
 		expiryMarginSec: opts.expiryMarginSec,
 		preferReplayable: opts.preferReplayable,
+		binding: opts.binding,
 		components: opts.components,
 		ttlSeconds: opts.ttlSeconds,
 		label: opts.label,
@@ -199,18 +205,6 @@ describe("erc8128Client", () => {
 			expect(headers.get("signature-input")).toContain("expires=");
 		});
 
-		it("uses request-bound binding when server config is unknown", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "request-bound" }),
-			);
-		});
-
 		it("preserves original headers when adding signature", async () => {
 			const { plugin } = await setupPluginWithConfig({});
 			const init = getInitHook(plugin);
@@ -255,90 +249,86 @@ describe("erc8128Client", () => {
 		});
 	});
 
-	describe("init hook — replayable routing", () => {
-		it("uses class-bound binding for replayable routes", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
+	describe("client configuration", () => {
+		it("passes user options to createSignerClient", async () => {
+			const { plugin } = await setupPluginWithConfig({
 				preferReplayable: true,
-				components: [],
+				binding: "class-bound",
+				components: ["@method"],
+				ttlSeconds: 120,
+				label: "my-label",
+				contentDigest: "auto",
+			});
+			const init = getInitHook(plugin);
+
+			// Trigger client creation
+			await init("/session", { baseURL: BASE_URL, method: "GET" });
+
+			expect(createSignerClient).toHaveBeenCalledWith(
+				expect.objectContaining({
+					address: defaultAddress,
+					chainId: defaultChainId,
+				}),
+				expect.objectContaining({
+					preferReplayable: true,
+					binding: "class-bound",
+					components: ["@method"],
+					ttlSeconds: 120,
+					label: "my-label",
+					contentDigest: "auto",
+				}),
+			);
+		});
+
+		it("applies server config via setServerConfig", async () => {
+			const { plugin } = await setupPluginWithConfig({
 				config: REPLAYABLE_CONFIG,
 			});
 			const init = getInitHook(plugin);
 
 			await init("/session", { baseURL: BASE_URL, method: "GET" });
 
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "class-bound" }),
+			expect(mockSetServerConfig).toHaveBeenCalledWith(
+				"http://localhost:3000",
+				REPLAYABLE_CONFIG,
 			);
 		});
 
-		it("uses request-bound when server disables replayable", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				preferReplayable: true,
-				components: [],
-				config: NON_REPLAYABLE_CONFIG,
+		it("does not call setServerConfig when config has not loaded", async () => {
+			const signFn = setupMockSignerClient();
+			const plugin = erc8128Client({
+				signer: createMockSigner(),
+				storage: false,
 			});
+			// Do NOT call getActions → serverConfig stays null
 			const init = getInitHook(plugin);
 
 			await init("/session", { baseURL: BASE_URL, method: "GET" });
 
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "request-bound" }),
-			);
+			expect(signFn).toHaveBeenCalledOnce();
+			expect(mockSetServerConfig).not.toHaveBeenCalled();
 		});
 
-		it("respects per-route replayable: false override", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				preferReplayable: true,
-				components: [],
-				config: {
-					max_validity_sec: 300,
-					route_policies: {
-						default: {
-							replayable: true,
-							classBoundPolicies: ["@authority"],
-						},
-						"POST /api/auth/erc8128/invalidate": { replayable: false },
-					},
-				},
+		it("recreates signer client when address changes", async () => {
+			let currentSigner = createMockSigner();
+			setupMockSignerClient();
+			const dynamicPlugin = erc8128Client({
+				signer: () => currentSigner,
+				storage: false,
 			});
-			const init = getInitHook(plugin);
+			const init = getInitHook(dynamicPlugin);
 
-			await init("/erc8128/invalidate", {
-				baseURL: BASE_URL,
-				method: "POST",
-			});
+			await init("/session", { baseURL: BASE_URL, method: "GET" });
+			expect(createSignerClient).toHaveBeenCalledTimes(1);
 
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "request-bound" }),
-			);
-		});
+			// Change signer identity
+			currentSigner = {
+				...currentSigner,
+				address: "0x0000000000000000000000000000000000001234",
+			};
 
-		it("matches wildcard route policies", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				preferReplayable: true,
-				components: [],
-				config: {
-					max_validity_sec: 300,
-					route_policies: {
-						default: {
-							replayable: true,
-							classBoundPolicies: ["@authority"],
-						},
-						"GET /api/auth/admin/*": { replayable: false },
-					},
-				},
-			});
-			const init = getInitHook(plugin);
-
-			await init("/admin/users", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "request-bound" }),
-			);
+			await init("/session", { baseURL: BASE_URL, method: "GET" });
+			expect(createSignerClient).toHaveBeenCalledTimes(2);
 		});
 	});
 
@@ -347,6 +337,7 @@ describe("erc8128Client", () => {
 			const store = createMockStore();
 			const { plugin } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: REPLAYABLE_CONFIG,
@@ -366,10 +357,11 @@ describe("erc8128Client", () => {
 			expect(entries[0].components).toEqual(DEFAULT_COMPONENTS);
 		});
 
-		it("does not cache request-bound signatures", async () => {
+		it("does not cache when server disables replayable", async () => {
 			const store = createMockStore();
 			const { plugin } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: NON_REPLAYABLE_CONFIG,
@@ -381,10 +373,94 @@ describe("erc8128Client", () => {
 			expect(store.set).not.toHaveBeenCalled();
 		});
 
+		it("does not cache when preferReplayable is false", async () => {
+			const store = createMockStore();
+			const { plugin } = await setupPluginWithConfig({
+				// preferReplayable defaults to false
+				binding: "class-bound",
+				components: [],
+				storage: store,
+				config: REPLAYABLE_CONFIG,
+			});
+			const init = getInitHook(plugin);
+
+			await init("/session", { baseURL: BASE_URL, method: "GET" });
+
+			expect(store.set).not.toHaveBeenCalled();
+		});
+
+		it("caches replayable signatures even when request-bound", async () => {
+			const store = createMockStore();
+			const { plugin } = await setupPluginWithConfig({
+				preferReplayable: true,
+				storage: store,
+				config: REPLAYABLE_CONFIG,
+			});
+			const init = getInitHook(plugin);
+
+			await init("/session", { baseURL: BASE_URL, method: "GET" });
+
+			expect(store.set).toHaveBeenCalled();
+		});
+
+		it("does not cache per-route replayable: false override", async () => {
+			const store = createMockStore();
+			const { plugin } = await setupPluginWithConfig({
+				preferReplayable: true,
+				binding: "class-bound",
+				components: [],
+				storage: store,
+				config: {
+					max_validity_sec: 300,
+					route_policies: {
+						default: {
+							replayable: true,
+							classBoundPolicies: ["@authority"],
+						},
+						"POST /api/auth/erc8128/invalidate": { replayable: false },
+					},
+				},
+			});
+			const init = getInitHook(plugin);
+
+			await init("/erc8128/invalidate", {
+				baseURL: BASE_URL,
+				method: "POST",
+			});
+
+			expect(store.set).not.toHaveBeenCalled();
+		});
+
+		it("does not cache wildcard route override", async () => {
+			const store = createMockStore();
+			const { plugin } = await setupPluginWithConfig({
+				preferReplayable: true,
+				binding: "class-bound",
+				components: [],
+				storage: store,
+				config: {
+					max_validity_sec: 300,
+					route_policies: {
+						default: {
+							replayable: true,
+							classBoundPolicies: ["@authority"],
+						},
+						"GET /api/auth/admin/*": { replayable: false },
+					},
+				},
+			});
+			const init = getInitHook(plugin);
+
+			await init("/admin/users", { baseURL: BASE_URL, method: "GET" });
+
+			expect(store.set).not.toHaveBeenCalled();
+		});
+
 		it("uses cached signature on second request (skips signRequest)", async () => {
 			const store = createMockStore();
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: REPLAYABLE_CONFIG,
@@ -424,6 +500,7 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: REPLAYABLE_CONFIG,
@@ -457,6 +534,7 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: REPLAYABLE_CONFIG,
@@ -487,6 +565,7 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: {
@@ -528,6 +607,7 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: {
@@ -575,6 +655,7 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: {
@@ -600,33 +681,6 @@ describe("erc8128Client", () => {
 			expect(headers.get("signature")).toBe("sig-method-authority");
 		});
 
-		it("passes components from route policy to signRequest", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				preferReplayable: true,
-				components: [],
-				config: {
-					max_validity_sec: 300,
-					route_policies: {
-						"GET /api/auth/session": {
-							replayable: true,
-							classBoundPolicies: ["@method", "@authority"],
-						},
-					},
-				},
-			});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({
-					binding: "class-bound",
-					components: expect.arrayContaining(["@method", "@authority"]),
-				}),
-			);
-		});
-
 		it("accepts cached sig when it satisfies default classBoundPolicies", async () => {
 			const store = createMockStore();
 			const now = Math.floor(Date.now() / 1000);
@@ -643,6 +697,7 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: REPLAYABLE_CONFIG,
@@ -670,6 +725,7 @@ describe("erc8128Client", () => {
 
 			const { plugin, signFn } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "class-bound",
 				components: [],
 				storage: store,
 				config: {
@@ -740,174 +796,6 @@ describe("erc8128Client", () => {
 			await actions.clearSignatureCache();
 
 			expect(store.delete).toHaveBeenCalledWith(defaultKeyId);
-		});
-	});
-
-	describe("client signing posture", () => {
-		it("defaults to request-bound even when server allows replayable", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				// preferReplayable defaults to false
-				config: REPLAYABLE_CONFIG,
-			});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "request-bound" }),
-			);
-		});
-
-		it("uses request-bound when preferReplayable is true but components is undefined", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				preferReplayable: true,
-				// components not set → undefined → request-bound
-				config: REPLAYABLE_CONFIG,
-			});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "request-bound" }),
-			);
-		});
-
-		it("does not cache when preferReplayable is true but components is undefined", async () => {
-			const store = createMockStore();
-			const { plugin } = await setupPluginWithConfig({
-				preferReplayable: true,
-				storage: store,
-				config: REPLAYABLE_CONFIG,
-			});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(store.set).not.toHaveBeenCalled();
-		});
-
-		it("uses class-bound when preferReplayable is true and components is []", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				preferReplayable: true,
-				components: [],
-				config: REPLAYABLE_CONFIG,
-			});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "class-bound" }),
-			);
-		});
-
-		it("merges client components with route classBoundPolicies", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				preferReplayable: true,
-				components: ["@method"],
-				config: {
-					max_validity_sec: 300,
-					route_policies: {
-						"GET /api/auth/session": {
-							replayable: true,
-							classBoundPolicies: ["@authority", "@target-uri"],
-						},
-					},
-				},
-			});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({
-					binding: "class-bound",
-					components: expect.arrayContaining([
-						"@method",
-						"@authority",
-						"@target-uri",
-					]),
-				}),
-			);
-		});
-
-		it("falls back to request-bound when server disables replayable", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				preferReplayable: true,
-				components: [],
-				config: NON_REPLAYABLE_CONFIG,
-			});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "request-bound" }),
-			);
-		});
-
-		it("uses request-bound when server config has not loaded yet", async () => {
-			const signFn = setupMockSignerClient();
-			const plugin = erc8128Client({
-				signer: createMockSigner(),
-				storage: false,
-				preferReplayable: true,
-				components: [],
-			});
-			// Do NOT call getActions → serverConfig stays null
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ binding: "request-bound" }),
-			);
-		});
-
-		it("forwards ttlSeconds and label to signRequest", async () => {
-			const { plugin, signFn } = await setupPluginWithConfig({
-				ttlSeconds: 120,
-				label: "my-label",
-			});
-			const init = getInitHook(plugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-
-			expect(signFn).toHaveBeenCalledWith(
-				expect.any(Request),
-				expect.objectContaining({ ttlSeconds: 120, label: "my-label" }),
-			);
-		});
-	});
-
-	describe("signer identity change", () => {
-		it("recreates signer client when address changes", async () => {
-			let currentSigner = createMockSigner();
-			setupMockSignerClient();
-			const dynamicPlugin = erc8128Client({
-				signer: () => currentSigner,
-				storage: false,
-			});
-			const init = getInitHook(dynamicPlugin);
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-			expect(createSignerClient).toHaveBeenCalledTimes(1);
-
-			// Change signer identity
-			currentSigner = {
-				...currentSigner,
-				address: "0x0000000000000000000000000000000000001234",
-			};
-
-			await init("/session", { baseURL: BASE_URL, method: "GET" });
-			expect(createSignerClient).toHaveBeenCalledTimes(2);
 		});
 	});
 });

@@ -15,6 +15,7 @@ export const walletAddressSchema = {
 			address: {
 				type: "string",
 				required: true,
+				index: true,
 			},
 			chainId: {
 				type: "number",

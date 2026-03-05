@@ -472,7 +472,14 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								]);
 								const notBeforeRecord = keyIdRecords.find((r) => !r.signature);
 
-								if (invalidatedRecord) {
+								// Only treat as invalidated if the record's keyId matches the signature's keyId
+								// (prevents User A from invalidating User B's signatures)
+								const sigInvalidatedByCaller =
+									invalidatedRecord &&
+									(!invalidatedRecord.keyId ||
+										invalidatedRecord.keyId === cached.keyId.toLowerCase());
+
+								if (sigInvalidatedByCaller) {
 									await cache.delete(signature);
 								} else if (
 									!notBeforeRecord ||
@@ -518,7 +525,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						}
 
 						if (!result) {
-							// Start invalidation check in parallel with verification (fail early if invalidated)
+							// Start invalidation check in parallel with verification
 							const inv = getInvalidationOps(ctx);
 							const invalidationPromise = signature
 								? inv.findBySignature(signature)
@@ -532,8 +539,23 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								},
 							});
 
-							const invalidatedRecord = await invalidationPromise;
-							if (invalidatedRecord) {
+							// Await both in parallel — we need the keyId from verification
+							// to confirm the invalidation record belongs to the same signer
+							const [invalidatedRecord, verifyResult] = await Promise.all([
+								invalidationPromise,
+								verificationPromise,
+							]);
+
+							const sigKeyId = verifyResult.ok
+								? verifyResult.params.keyid.toLowerCase()
+								: null;
+							const sigInvalidatedByCaller =
+								invalidatedRecord &&
+								sigKeyId &&
+								(!invalidatedRecord.keyId ||
+									invalidatedRecord.keyId === sigKeyId);
+
+							if (sigInvalidatedByCaller) {
 								await cache.delete(signature!);
 								if (!resolvedRoutePolicy.requireAuth) {
 									return;
@@ -554,7 +576,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								);
 							}
 
-							result = await verificationPromise;
+							result = verifyResult;
 						}
 						if (!result.ok) {
 							if (!resolvedRoutePolicy.requireAuth) {
@@ -574,34 +596,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									},
 								},
 							);
-						}
-
-						if (replayableEnabled) {
-							const invOps = getInvalidationOps(ctx);
-							const records = await invOps.findByKeyId(result.params.keyid);
-							const notBeforeRecord = records.find((r) => !r.signature);
-							if (
-								notBeforeRecord &&
-								result.params.created < notBeforeRecord.notBefore
-							) {
-								if (!resolvedRoutePolicy.requireAuth) {
-									return;
-								}
-								return new Response(
-									JSON.stringify({
-										error: "erc8128_verification_failed",
-										reason: "replayable_invalidated",
-										detail: "Replayable signature was invalidated",
-									}),
-									{
-										status: 401,
-										headers: {
-											"Content-Type": "application/json",
-											...responseHeaders,
-										},
-									},
-								);
-							}
 						}
 
 						// Cache replayable verification result

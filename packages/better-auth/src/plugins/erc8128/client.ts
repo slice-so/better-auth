@@ -6,6 +6,7 @@ import type {
 import type { BetterFetch, BetterFetchOption } from "@better-fetch/fetch";
 import type {
 	EthHttpSigner,
+	ReplayMode,
 	RoutePolicy,
 	ServerConfig,
 	SignerClient,
@@ -206,6 +207,7 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 
 	const store = resolveStore(options);
 	const margin = expiryMarginSec ?? DEFAULT_EXPIRY_MARGIN_SEC;
+	const replay: ReplayMode = preferReplayable ? "replayable" : "non-replayable";
 
 	let serverConfig: ServerConfig | null = null;
 	let signerClient: SignerClient | null = null;
@@ -223,7 +225,10 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 	function getClient(signer: EthHttpSigner): SignerClient {
 		const key = `${signer.chainId}:${signer.address.toLowerCase()}`;
 		if (signerClient && signerKey === key) return signerClient;
-		signerClient = createSignerClient(signer);
+		signerClient = createSignerClient(signer, {
+			preferReplayable,
+			...forwardedSignOptions,
+		});
 		signerKey = key;
 		return signerClient;
 	}
@@ -288,28 +293,23 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 					const client = getClient(signer);
 					const keyId = getKeyId(signer);
 
-					// -- determine signing posture via library ----------------------
-					// When server config hasn't loaded yet, use safest posture.
-					const wantsClassBound =
-						preferReplayable && forwardedSignOptions.components !== undefined;
-					const posture = serverConfig
-						? resolvePosture(method, parsedUrl.pathname, serverConfig, {
-								...forwardedSignOptions,
-								binding: wantsClassBound
-									? "class-bound"
-									: (forwardedSignOptions.binding ?? "request-bound"),
-								replay: preferReplayable ? "replayable" : "non-replayable",
-							})
-						: {
-								binding: "request-bound" as const,
-								replay: "non-replayable" as const,
-								components: undefined,
-							};
-					const useCache =
-						posture.binding === "class-bound" &&
-						posture.replay === "replayable";
+					// Apply server config to the client so it can resolve posture
+					if (serverConfig) {
+						client.setServerConfig(parsedUrl.origin, serverConfig);
+					}
 
-					// Resolve route policy for cache matching
+					// Resolve posture for cache decision only — the client handles
+					// posture resolution internally when signing.
+					const posture = resolvePosture(
+						method,
+						parsedUrl.pathname,
+						serverConfig,
+						{ ...forwardedSignOptions, replay },
+					);
+					const useCache = posture.replay === "replayable";
+
+					// Resolve route policy for cache matching (supports
+					// list-of-lists classBoundPolicies alternatives)
 					const routePolicy =
 						useCache && serverConfig?.route_policies
 							? matchRoutePolicy(
@@ -353,18 +353,13 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 						}
 					}
 
-					// Build a temporary Request for signing
+					// Sign — the client resolves posture internally
 					const tempReq = new Request(fullUrl, {
 						method,
 						headers: (fetchOptions?.headers as HeadersInit) || {},
 					});
 
-					const signedReq = await client.signRequest(tempReq, {
-						...forwardedSignOptions,
-						binding: posture.binding,
-						replay: posture.replay,
-						...(posture.components ? { components: posture.components } : {}),
-					});
+					const signedReq = await client.signRequest(tempReq);
 
 					const sig = signedReq.headers.get("signature");
 					const sigInput = signedReq.headers.get("signature-input");
