@@ -17,6 +17,7 @@ import {
 } from "@slicekit/erc8128";
 import * as z from "zod";
 import { APIError } from "../../api";
+import { getSessionFromCtx } from "../../api/routes/session";
 import { setSessionCookie } from "../../cookies";
 import { mergeSchema } from "../../db/schema";
 import type { InferOptionSchema, User } from "../../types";
@@ -27,6 +28,7 @@ import {
 	createDBInvalidationOps,
 	createDualInvalidationOps,
 	createSecondaryStorageInvalidationOps,
+	DEFAULT_INVALIDATION_TTL_SEC,
 } from "./invalidation-store";
 import {
 	createAdapterNonceStore,
@@ -54,8 +56,6 @@ const DEFAULT_MAX_VALIDITY_SEC = 300;
 const DEFAULT_CLOCK_SKEW_SEC = 30;
 /** Only verify one signature per request (the first valid one). */
 const MAX_SIGNATURE_VERIFICATIONS = 1;
-/** Minimum TTL floor for invalidation records (30 days). */
-export const DEFAULT_INVALIDATION_TTL_SEC = 30 * 24 * 60 * 60;
 
 declare module "@better-auth/core" {
 	interface BetterAuthPluginRegistry<AuthOptions, Options> {
@@ -102,6 +102,23 @@ export interface ERC8128PluginOptions {
 	 * @default false
 	 */
 	storeInDatabase?: boolean | undefined;
+	/**
+	 * How to handle requests that carry both a session cookie and an
+	 * ERC-8128 signature.
+	 *
+	 * - `"session-first"` — session cookie wins; signature verification
+	 *   is skipped (default).
+	 * - `"signature-first"` — signature wins; session cookie is ignored.
+	 * - `"reject-on-mismatch"` — both are verified; if they map to
+	 *   different users, return 401.
+	 *
+	 * @default "session-first"
+	 */
+	authPrecedence?:
+		| "session-first"
+		| "signature-first"
+		| "reject-on-mismatch"
+		| undefined;
 }
 
 const invalidateBodySchema = z
@@ -126,6 +143,29 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 	const maxCacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
 	let cacheOps: VerificationCacheOps | null = null;
 	let invalidationOpsInstance: InvalidationOps | null = null;
+	let nonceStoreInstance: ReturnType<typeof createAdapterNonceStore> | null =
+		null;
+
+	const getNonceStore = (ctx: GenericEndpointContext) => {
+		if (!nonceStoreInstance) {
+			if (ctx.context.secondaryStorage) {
+				const ssStore = createSecondaryStorageNonceStore(
+					ctx.context.secondaryStorage,
+				);
+				nonceStoreInstance = options.storeInDatabase
+					? createDualNonceStore(
+							createAdapterNonceStore(ctx.context.internalAdapter),
+							ssStore,
+						)
+					: ssStore;
+			} else {
+				nonceStoreInstance = createAdapterNonceStore(
+					ctx.context.internalAdapter,
+				);
+			}
+		}
+		return nonceStoreInstance;
+	};
 
 	const getCache = (ctx: GenericEndpointContext): VerificationCacheOps => {
 		if (!cacheOps) {
@@ -167,22 +207,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			}
 		}
 		return invalidationOpsInstance;
-	};
-
-	const getNonceStore = (ctx: GenericEndpointContext) => {
-		if (ctx.context.secondaryStorage) {
-			const ssStore = createSecondaryStorageNonceStore(
-				ctx.context.secondaryStorage,
-			);
-			if (options.storeInDatabase) {
-				return createDualNonceStore(
-					createAdapterNonceStore(ctx.context.internalAdapter),
-					ssStore,
-				);
-			}
-			return ssStore;
-		}
-		return createAdapterNonceStore(ctx.context.internalAdapter);
 	};
 
 	const findOrCreateWalletUser = async (
@@ -352,12 +376,14 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							return;
 						}
 
-						// If a session cookie is present, skip ERC-8128 verification
-						// and let normal session handling authenticate the request.
 						const cookieHeader = incomingHeaders.get("cookie") || "";
-						if (
-							cookieHeader.includes(ctx.context.authCookies.sessionToken.name)
-						) {
+						const hasSessionCookie = cookieHeader.includes(
+							ctx.context.authCookies.sessionToken.name,
+						);
+						const precedence = options.authPrecedence ?? "session-first";
+
+						// session-first: skip signature verification when a session cookie exists
+						if (hasSessionCookie && precedence === "session-first") {
 							return;
 						}
 
@@ -599,7 +625,36 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 						const walletAddress = result.address;
 						const chainId = result.chainId;
-						await findOrCreateWalletUser(ctx, walletAddress, chainId);
+						const walletUser = await findOrCreateWalletUser(
+							ctx,
+							walletAddress,
+							chainId,
+						);
+
+						// reject-on-mismatch: if both session and signature are present
+						// and resolve to different users, reject the request
+						if (hasSessionCookie && precedence === "reject-on-mismatch") {
+							const currentSession = await getSessionFromCtx(ctx);
+							if (
+								currentSession &&
+								walletUser &&
+								currentSession.user.id !== walletUser.id
+							) {
+								return new Response(
+									JSON.stringify({
+										error: "erc8128_verification_failed",
+										reason: "identity_mismatch",
+										detail: "Session user does not match signature identity",
+									}),
+									{
+										status: 401,
+										headers: {
+											"Content-Type": "application/json",
+										},
+									},
+								);
+							}
+						}
 					}),
 				},
 			],

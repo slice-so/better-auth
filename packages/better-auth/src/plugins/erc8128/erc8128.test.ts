@@ -651,6 +651,146 @@ describe("erc8128 plugin", () => {
 			});
 		});
 
+		it("session-first (default): skips signature verification when session cookie is present", async () => {
+			const verifySpy = vi.fn(async () => okResult());
+			vi.mocked(createVerifierClient).mockImplementation(() => ({
+				verifyRequest: verifySpy,
+			}));
+			const { auth } = await getTestInstance({
+				plugins: [erc8128({ verifyMessage: async () => true })],
+			});
+
+			// Create a session via /verify
+			const verified = await post(auth, "/erc8128/verify");
+			const cookie = cookieFromSetCookie(
+				verified.response.headers.get("set-cookie"),
+			);
+
+			verifySpy.mockClear();
+
+			// Request with both cookie and signature headers — session-first should skip verification
+			const { response, data } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 should-be-skipped",
+					signature: "sig-skipped",
+					cookie,
+				},
+			});
+			expect(response.status).toBe(200);
+			expect(data.session).toBeDefined();
+			expect(verifySpy).not.toHaveBeenCalled();
+		});
+
+		it("signature-first: verifies signature even when session cookie is present", async () => {
+			mockVerifier(async () => okResult());
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						authPrecedence: "signature-first",
+					}),
+				],
+			});
+
+			// Create a session via /verify
+			const verified = await post(auth, "/erc8128/verify");
+			const cookie = cookieFromSetCookie(
+				verified.response.headers.get("set-cookie"),
+			);
+
+			const verifySpy = vi.fn(async () => okResult());
+			vi.mocked(createVerifierClient).mockImplementation(() => ({
+				verifyRequest: verifySpy,
+			}));
+
+			// Request with both cookie and signature headers — should still verify
+			const { response } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 verified-anyway",
+					signature: "sig-verified",
+					cookie,
+				},
+			});
+			expect(response.status).toBe(200);
+			expect(verifySpy).toHaveBeenCalled();
+		});
+
+		it("reject-on-mismatch: passes when session and signature resolve to the same user", async () => {
+			mockVerifier(async () => okResult());
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						authPrecedence: "reject-on-mismatch",
+					}),
+				],
+			});
+
+			// Create a session via /verify (user created from defaultAddress)
+			const verified = await post(auth, "/erc8128/verify");
+			const cookie = cookieFromSetCookie(
+				verified.response.headers.get("set-cookie"),
+			);
+			expect(verified.response.status).toBe(200);
+
+			// Request with cookie + same wallet signature — should pass
+			const { response, data } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 same-user",
+					signature: "sig-same",
+					cookie,
+				},
+			});
+			expect(response.status).toBe(200);
+			expect(data.session).toBeDefined();
+		});
+
+		it("reject-on-mismatch: returns 401 when session and signature resolve to different users", async () => {
+			const otherAddress =
+				"0x0000000000000000000000000000000000001234" as const;
+			let call = 0;
+			mockVerifier(async () => {
+				call += 1;
+				// First call: /verify creates session for defaultAddress
+				if (call === 1) return okResult();
+				// Second call: middleware verifies as otherAddress
+				return okResult({
+					address: otherAddress,
+					keyId: formatKeyId(defaultChainId, otherAddress),
+				});
+			});
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						authPrecedence: "reject-on-mismatch",
+					}),
+				],
+			});
+
+			// Create session for defaultAddress
+			const verified = await post(auth, "/erc8128/verify");
+			const cookie = cookieFromSetCookie(
+				verified.response.headers.get("set-cookie"),
+			);
+			expect(verified.response.status).toBe(200);
+
+			// Request with cookie (defaultAddress user) + signature (otherAddress) — mismatch
+			const { response, data } = await get(auth, "/get-session", {
+				headers: {
+					authorization: "ERC-8128 different-user",
+					signature: "sig-different",
+					cookie,
+				},
+			});
+			expect(response.status).toBe(401);
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "identity_mismatch",
+			});
+		});
+
 		it("unmatched route without routePolicy.default uses opportunistic fallthrough", async () => {
 			mockVerifier(async ({ request }) => {
 				if (request.url.endsWith("/verify")) {

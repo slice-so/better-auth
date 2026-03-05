@@ -1,7 +1,8 @@
 import type { SecondaryStorage } from "@better-auth/core/db";
 import type { Where } from "@better-auth/core/db/adapter";
-import { DEFAULT_INVALIDATION_TTL_SEC } from ".";
 
+/** Minimum TTL floor for invalidation records (30 days). */
+export const DEFAULT_INVALIDATION_TTL_SEC = 30 * 24 * 60 * 60;
 const INV_KEY_PREFIX = "erc8128:inv:keyid:";
 const INV_SIG_PREFIX = "erc8128:inv:sig:";
 

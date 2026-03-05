@@ -7,6 +7,17 @@ description: Authenticate requests with Ethereum accounts using HTTP Message Sig
 
 This plugin integrates ERC-8128 into Better Auth with two modes: **session-based authentication** (sign once via `/erc8128/verify`, get a session, use cookies normally) and **per-request authentication** where every call is individually signed. Better Auth handles the required server-side state — nonce tracking, signature invalidation, and verification caching — adding cryptographic request signing to your application with minimal operational complexity.
 
+## Why ERC-8128?
+
+Session-based wallet authentication (sign a challenge, get a cookie) protects the login step but not what follows — every subsequent request travels with a bearer token that can be stolen, replayed, or misrouted. ERC-8128 signs **every request** individually, binding the signature to the HTTP method, path, headers, and body:
+
+- **Request integrity** — each call is independently authenticated and tamper-evident.
+- **No bearer credentials** — nothing to leak, rotate, or revoke.
+- **Replay protection** — built-in nonces prevent captured requests from being reused.
+- **Stateless option** — works without sessions, cookies, or server-side state.
+
+This makes ERC-8128 the natural authentication layer for **autonomous agents and machine-to-machine calls**. An agent with an Ethereum key can authenticate with any ERC-8128-enabled endpoint — no API key provisioning, no OAuth flows, no manual setup. Enabling ERC-8128 on your server makes it instantly accessible to the entire ecosystem of onchain agents.
+
 ## Installation
 
 <Steps>
@@ -320,6 +331,7 @@ For production deployments with multiple server instances, configure `secondaryS
 | `sessionExpiresIn` | `number` | — | Session TTL in seconds (for `/erc8128/verify`). |
 | `maxValiditySec` | `number` | `300` | Maximum signature validity window (seconds). |
 | `clockSkewSec` | `number` | `30` | Allowed clock skew (seconds). |
+| `authPrecedence` | `"session-first" \| "signature-first" \| "reject-on-mismatch"` | `"session-first"` | How to handle requests that carry both a session cookie and an ERC-8128 signature. `session-first` skips verification; `signature-first` ignores the cookie; `reject-on-mismatch` verifies both and returns 401 if they map to different users. |
 | `storeInDatabase` | `boolean` | `false` | When `secondaryStorage` is configured, also persist nonces and invalidation to the database. See [Storage](#storage). |
 | `cacheSize` | `number` | `10000` | Max entries in the in-memory verification cache. Ignored when `secondaryStorage` is active. |
 | `emailDomainName` | `string` | From `baseURL` | Domain for auto-generated user emails. |
