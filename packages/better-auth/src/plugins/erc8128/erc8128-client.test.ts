@@ -1,4 +1,5 @@
 import type {
+	AcceptSignatureSignOptions,
 	EthHttpSigner,
 	ServerConfig,
 	SignerClient,
@@ -78,18 +79,22 @@ function mockSignRequestFn(opts?: {
 }) {
 	const created = opts?.created ?? Math.floor(Date.now() / 1000);
 	const expires = opts?.expires ?? created + 300;
-	const components = opts?.components ?? DEFAULT_COMPONENTS;
-	const componentStr = components.map((c) => `"${c}"`).join(" ");
 
-	return vi.fn(async (req: Request) => {
-		const headers = new Headers(req.headers);
-		headers.set("signature", "sig1=:bW9jaw==:");
-		headers.set(
-			"signature-input",
-			`sig1=(${componentStr});created=${created};expires=${expires};keyid="${defaultKeyId}"`,
-		);
-		return new Request(req.url, { method: req.method, headers });
-	});
+	return vi.fn(
+		async (req: Request, signOptions?: AcceptSignatureSignOptions) => {
+			const headers = new Headers(req.headers);
+			const components = signOptions?.components?.length
+				? signOptions.components
+				: (opts?.components ?? DEFAULT_COMPONENTS);
+			const componentStr = components.map((c) => `"${c}"`).join(" ");
+			headers.set("signature", "sig1=:bW9jaw==:");
+			headers.set(
+				"signature-input",
+				`sig1=(${componentStr});created=${created};expires=${expires};keyid="${defaultKeyId}"${signOptions?.replay === "non-replayable" ? ';nonce=\"nonce-1\"' : ""}`,
+			);
+			return new Request(req.url, { method: req.method, headers });
+		},
+	);
 }
 
 function mockRequestBoundSignRequestFn(opts?: {
@@ -99,15 +104,17 @@ function mockRequestBoundSignRequestFn(opts?: {
 	const created = opts?.created ?? Math.floor(Date.now() / 1000);
 	const expires = opts?.expires ?? created + 300;
 
-	return vi.fn(async (req: Request) => {
-		const headers = new Headers(req.headers);
-		headers.set("signature", "sig1=:cmVxdWVzdA==:");
-		headers.set(
-			"signature-input",
-			`sig1=("@method" "@target-uri" "@authority");created=${created};expires=${expires};keyid="${defaultKeyId}"`,
-		);
-		return new Request(req.url, { method: req.method, headers });
-	});
+	return vi.fn(
+		async (req: Request, signOptions?: AcceptSignatureSignOptions) => {
+			const headers = new Headers(req.headers);
+			headers.set("signature", "sig1=:cmVxdWVzdA==:");
+			headers.set(
+				"signature-input",
+				`sig1=("@method" "@target-uri" "@authority");created=${created};expires=${expires};keyid="${defaultKeyId}"${signOptions?.replay === "non-replayable" ? ';nonce=\"nonce-1\"' : ""}`,
+			);
+			return new Request(req.url, { method: req.method, headers });
+		},
+	);
 }
 
 /** The mock `setServerConfig` from the last `setupMockSignerClient` call. */
@@ -169,6 +176,25 @@ function getInitHook(plugin: ReturnType<typeof erc8128Client>) {
 		url: string,
 		fetchOptions?: Record<string, unknown>,
 	) => Promise<{ url: string; options?: Record<string, unknown> }>;
+}
+
+async function runCustomFetch(
+	result: { url: string; options?: Record<string, unknown> },
+	url = `${BASE_URL}/session`,
+) {
+	const customFetchImpl = result.options?.customFetchImpl as
+		| ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
+		| undefined;
+	if (!customFetchImpl) {
+		throw new Error("customFetchImpl missing");
+	}
+	return customFetchImpl(
+		new Request(url, {
+			method: (result.options?.method as string) || "GET",
+			headers: result.options?.headers as HeadersInit,
+			body: result.options?.body as BodyInit | undefined,
+		}),
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +314,264 @@ describe("erc8128Client", () => {
 
 			expect(signFn).not.toHaveBeenCalled();
 			expect(result.url).toBe("/session");
+		});
+
+		it("retries once on 401 with Accept-Signature", async () => {
+			const signFn = mockSignRequestFn();
+			const fetchImpl = vi
+				.fn<
+					(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+				>()
+				.mockResolvedValueOnce(
+					new Response(null, {
+						status: 401,
+						headers: {
+							"accept-signature":
+								'sig1=("@authority" "@method" "@path");keyid;created;expires;nonce',
+						},
+					}),
+				)
+				.mockResolvedValueOnce(new Response(null, { status: 200 }));
+			const { plugin } = await setupPluginWithConfig({
+				signFn,
+				config: REPLAYABLE_CONFIG,
+				preferReplayable: true,
+				binding: "class-bound",
+				components: ["@method"],
+			});
+			const init = getInitHook(plugin);
+
+			const result = await init("/session", {
+				baseURL: BASE_URL,
+				method: "GET",
+				customFetchImpl: fetchImpl,
+			});
+			const response = await runCustomFetch(result);
+
+			expect(response.status).toBe(200);
+			expect(fetchImpl).toHaveBeenCalledTimes(2);
+			expect(signFn).toHaveBeenCalledTimes(2);
+			expect(signFn.mock.calls[1]?.[1]).toMatchObject({
+				binding: "request-bound",
+				replay: "non-replayable",
+			});
+		});
+
+		it("does not retry on 401 without Accept-Signature", async () => {
+			const signFn = mockSignRequestFn();
+			const fetchImpl = vi
+				.fn<
+					(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+				>()
+				.mockResolvedValueOnce(new Response(null, { status: 401 }));
+			const { plugin } = await setupPluginWithConfig({
+				signFn,
+				config: REPLAYABLE_CONFIG,
+			});
+			const init = getInitHook(plugin);
+
+			const result = await init("/session", {
+				baseURL: BASE_URL,
+				method: "GET",
+				customFetchImpl: fetchImpl,
+			});
+			const response = await runCustomFetch(result);
+
+			expect(response.status).toBe(401);
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(signFn).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not retry on non-401 responses even with Accept-Signature", async () => {
+			const signFn = mockSignRequestFn();
+			const fetchImpl = vi
+				.fn<
+					(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+				>()
+				.mockResolvedValueOnce(
+					new Response(null, {
+						status: 403,
+						headers: {
+							"accept-signature":
+								'sig1=("@authority" "@method" "@path");keyid;created;expires;nonce',
+						},
+					}),
+				);
+			const { plugin } = await setupPluginWithConfig({
+				signFn,
+				config: REPLAYABLE_CONFIG,
+			});
+			const init = getInitHook(plugin);
+
+			const result = await init("/session", {
+				baseURL: BASE_URL,
+				method: "GET",
+				customFetchImpl: fetchImpl,
+			});
+			const response = await runCustomFetch(result);
+
+			expect(response.status).toBe(403);
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(signFn).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not retry more than once", async () => {
+			const signFn = mockSignRequestFn();
+			const fetchImpl = vi
+				.fn<
+					(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+				>()
+				.mockResolvedValueOnce(
+					new Response(null, {
+						status: 401,
+						headers: {
+							"accept-signature":
+								'sig1=("@authority" "@method" "@path");keyid;created;expires;nonce',
+						},
+					}),
+				)
+				.mockResolvedValueOnce(
+					new Response(null, {
+						status: 401,
+						headers: {
+							"accept-signature":
+								'sig1=("@authority" "@method" "@path");keyid;created;expires;nonce',
+						},
+					}),
+				);
+			const { plugin } = await setupPluginWithConfig({
+				signFn,
+				config: REPLAYABLE_CONFIG,
+				preferReplayable: true,
+				binding: "class-bound",
+				components: ["@method"],
+			});
+			const init = getInitHook(plugin);
+
+			const result = await init("/session", {
+				baseURL: BASE_URL,
+				method: "GET",
+				customFetchImpl: fetchImpl,
+			});
+			const response = await runCustomFetch(result);
+
+			expect(response.status).toBe(401);
+			expect(fetchImpl).toHaveBeenCalledTimes(2);
+			expect(signFn).toHaveBeenCalledTimes(2);
+		});
+
+		it("skips retry when Accept-Signature resolves to the attempted posture", async () => {
+			const signFn = mockSignRequestFn();
+			const fetchImpl = vi
+				.fn<
+					(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+				>()
+				.mockResolvedValueOnce(
+					new Response(null, {
+						status: 401,
+						headers: {
+							"accept-signature":
+								'sig1=("@authority" "@method" "@path");keyid;created;expires;nonce',
+						},
+					}),
+				);
+			const { plugin } = await setupPluginWithConfig({
+				signFn,
+				config: REPLAYABLE_CONFIG,
+			});
+			const init = getInitHook(plugin);
+
+			const result = await init("/session", {
+				baseURL: BASE_URL,
+				method: "GET",
+				customFetchImpl: fetchImpl,
+			});
+			const response = await runCustomFetch(result);
+
+			expect(response.status).toBe(401);
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(signFn).toHaveBeenCalledTimes(1);
+		});
+
+		it("returns the original response when Accept-Signature is malformed", async () => {
+			const signFn = mockSignRequestFn();
+			const fetchImpl = vi
+				.fn<
+					(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+				>()
+				.mockResolvedValueOnce(
+					new Response(null, {
+						status: 401,
+						headers: { "accept-signature": "not-valid" },
+					}),
+				);
+			const { plugin } = await setupPluginWithConfig({
+				signFn,
+				config: REPLAYABLE_CONFIG,
+			});
+			const init = getInitHook(plugin);
+
+			const result = await init("/session", {
+				baseURL: BASE_URL,
+				method: "GET",
+				customFetchImpl: fetchImpl,
+			});
+			const response = await runCustomFetch(result);
+
+			expect(response.status).toBe(401);
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(signFn).toHaveBeenCalledTimes(1);
+		});
+
+		it("retry re-signs from the original request body and headers", async () => {
+			const seenBodies: string[] = [];
+			const signFn = vi.fn(
+				async (req: Request, signOptions?: AcceptSignatureSignOptions) => {
+					seenBodies.push(await req.clone().text());
+					const headers = new Headers(req.headers);
+					headers.set("signature", "sig1=:bW9jaw==:");
+					headers.set(
+						"signature-input",
+						`sig1=("@authority" "@method" "@path" "content-digest");created=1;expires=301;keyid="${defaultKeyId}"${signOptions?.replay === "non-replayable" ? ';nonce=\"nonce-1\"' : ""}`,
+					);
+					return new Request(req.url, { method: req.method, headers });
+				},
+			);
+			const fetchImpl = vi
+				.fn<
+					(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+				>()
+				.mockResolvedValueOnce(
+					new Response(null, {
+						status: 401,
+						headers: {
+							"accept-signature":
+								'sig1=("@authority" "@method" "@path" "content-digest");keyid;created;expires;nonce',
+						},
+					}),
+				)
+				.mockResolvedValueOnce(new Response(null, { status: 200 }));
+			const { plugin } = await setupPluginWithConfig({
+				signFn: signFn as ReturnType<typeof mockSignRequestFn>,
+				config: REPLAYABLE_CONFIG,
+				preferReplayable: true,
+				binding: "class-bound",
+				components: ["@method"],
+			});
+			const init = getInitHook(plugin);
+
+			const result = await init("/session", {
+				baseURL: BASE_URL,
+				method: "POST",
+				headers: { "content-type": "application/json", "x-custom": "yes" },
+				body: JSON.stringify({ hello: "world" }),
+				customFetchImpl: fetchImpl,
+				duplex: "half",
+			});
+			await runCustomFetch(result, `${BASE_URL}/session`);
+
+			expect(signFn).toHaveBeenCalledTimes(2);
+			expect(seenBodies).toEqual(['{"hello":"world"}', '{"hello":"world"}']);
 		});
 	});
 
@@ -740,7 +1024,7 @@ describe("erc8128Client", () => {
 			expect(saved[1]!.signature).toBe("sig1=:bW9jaw==:"); // fresh appended
 		});
 
-		it("selects correct entry from multiple cached signatures", async () => {
+		it("treats semantically equivalent class-bound entries as interchangeable", async () => {
 			const store = createMockStore();
 			const now = Math.floor(Date.now() / 1000);
 
@@ -783,8 +1067,7 @@ describe("erc8128Client", () => {
 
 			expect(signFn).not.toHaveBeenCalled();
 			const headers = result.options?.headers as Headers;
-			// Second entry matches — first doesn't cover @authority
-			expect(headers.get("signature")).toBe("sig-method-authority");
+			expect(headers.get("signature")).toBe("sig-method-only");
 		});
 
 		it("accepts cached sig when it satisfies default classBoundPolicies", async () => {
@@ -815,7 +1098,7 @@ describe("erc8128Client", () => {
 			expect(signFn).not.toHaveBeenCalled();
 		});
 
-		it("matches when cached sig satisfies one of multiple classBoundPolicies", async () => {
+		it("signs fresh when resolvePosture selects a different class-bound policy", async () => {
 			const store = createMockStore();
 			const now = Math.floor(Date.now() / 1000);
 
@@ -853,7 +1136,7 @@ describe("erc8128Client", () => {
 
 			await init("/session", { baseURL: BASE_URL, method: "GET" });
 
-			expect(signFn).not.toHaveBeenCalled();
+			expect(signFn).toHaveBeenCalledOnce();
 		});
 	});
 

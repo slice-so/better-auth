@@ -3,11 +3,15 @@ import type {
 	BetterAuthClientPlugin,
 	ClientStore,
 } from "@better-auth/core";
-import type { BetterFetch, BetterFetchOption } from "@better-fetch/fetch";
 import type {
+	BetterFetch,
+	BetterFetchOption,
+	FetchEsque,
+} from "@better-fetch/fetch";
+import type {
+	AcceptSignatureSignOptions,
 	EthHttpSigner,
 	ReplayMode,
-	RoutePolicy,
 	ServerConfig,
 	SignerClient,
 	SignerClientOptions,
@@ -15,107 +19,55 @@ import type {
 import {
 	createSignerClient,
 	formatKeyId,
-	matchRoutePolicy,
+	normalizeAcceptSignatureSignOptions,
+	parseAcceptSignatureHeader,
+	parseSignatureInputHeader,
 	resolvePosture,
+	selectAcceptSignatureRetryOptions,
 } from "@slicekit/erc8128";
 import type { erc8128 } from ".";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export interface CachedSignature {
 	signature: string;
 	signatureInput: string;
 	expires: number;
+	signOptions?: AcceptSignatureSignOptions;
 	binding?: "request-bound" | "class-bound";
 	requestKey?: string;
-	/** Derived-component identifiers covered by this signature. */
 	components: string[];
 }
 
-/**
- * Async-capable signature store for caching replayable signatures.
- * Implement this for backend/Node.js environments that don't have
- * `localStorage` (e.g. Redis, database, in-memory Map).
- *
- * Each keyId maps to an **array** of cached signatures. Replayable
- * request-bound signatures are reused only for the exact same request
- * fingerprint, while class-bound signatures can satisfy multiple routes
- * when their covered components are sufficient.
- */
 export interface Erc8128SignatureStore {
-	/** Retrieve all cached signatures for a keyId, or `null` if none. */
 	get(
 		keyId: string,
 	): CachedSignature[] | null | Promise<CachedSignature[] | null>;
-	/** Replace the full set of cached signatures for a keyId. */
 	set(keyId: string, entries: CachedSignature[]): void | Promise<void>;
-	/** Remove all cached entries for a keyId. */
 	delete(keyId: string): void | Promise<void>;
 }
 
-/**
- * Fields from `ClientOptions` that the plugin manages internally.
- * - `serverConfigs` — fetched from `/.well-known/erc8128` by the plugin.
- * - `fetch` — not needed (Better Auth handles fetching).
- */
 type PluginManagedOptions = "serverConfigs" | "fetch";
 
 export interface Erc8128ClientOptions
 	extends Omit<SignerClientOptions, PluginManagedOptions> {
-	/**
-	 * ERC-8128 signer identity. Can be a static object or a function
-	 * returning one (for lazy/dynamic wallet connections).
-	 * When the function returns `null`/`undefined`, requests are not signed.
-	 */
 	signer?: EthHttpSigner | (() => EthHttpSigner | null | undefined);
-	/**
-	 * Key prefix used by the built-in `localStorage` adapter.
-	 * Ignored when a custom `Erc8128SignatureStore` is provided.
-	 * @default "erc8128"
-	 */
 	storagePrefix?: string;
-	/**
-	 * Seconds before actual expiry to consider a cached signature stale.
-	 * Prevents races with server-side expiry checks.
-	 * @default 10
-	 */
 	expiryMarginSec?: number;
-	/**
-	 * Where to cache replayable signatures.
-	 *
-	 * - `"localStorage"` — use the browser `localStorage` (default in browsers).
-	 * - An `Erc8128SignatureStore` object — custom async-capable store
-	 *   (Redis, database, in-memory Map, etc.) for backend use.
-	 * - `false` — disable caching entirely.
-	 *
-	 * When omitted, `localStorage` is used if available, otherwise no caching.
-	 */
 	storage?: "localStorage" | Erc8128SignatureStore | false;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 const SKIP_PATHS = ["/.well-known/erc8128"];
-/** Seconds before actual expiry to consider a cached signature stale. */
 const DEFAULT_EXPIRY_MARGIN_SEC = 10;
+const MAX_ACCEPT_SIGNATURE_RETRIES = 1;
 
-function parseExpiresFromSignatureInput(signatureInput: string): number | null {
-	const match = signatureInput.match(/expires=(\d+)/);
-	return match ? Number(match[1]) : null;
-}
+type RequestInitWithDuplex = RequestInit & {
+	duplex?: "half" | "full";
+};
 
-/** Parse the component list from a Signature-Input value, e.g. `("@authority" "x-hdr")`. */
-function parseComponentsFromSignatureInput(signatureInput: string): string[] {
-	const match = signatureInput.match(/=\(([^)]*)\)/);
-	if (!match) return [];
-	const inner = match[1]!.trim();
-	if (!inner) return [];
-	return [...inner.matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
-}
+type SignedRequestResult = {
+	headers: Headers;
+	signature: string;
+	signatureInput: string;
+};
 
 function isBodyInit(body: unknown): body is BodyInit {
 	return (
@@ -170,35 +122,52 @@ async function createRequestFingerprint(request: Request): Promise<string> {
 	});
 }
 
-function matchesCachedSignature(
-	entry: CachedSignature,
-	routePolicy: RoutePolicy | undefined,
-	requestKey: string,
-): boolean {
-	if (entry.binding === "request-bound") {
-		return entry.requestKey === requestKey;
-	}
-
-	return matchesClassBoundPolicy(entry.components, routePolicy);
+function arraysEqual(left: string[], right: string[]): boolean {
+	return (
+		left.length === right.length &&
+		left.every((value, index) => value === right[index])
+	);
 }
 
-/**
- * Check whether a cached signature's components satisfy at least one of
- * the route's classBoundPolicies. Returns `true` when no policy is set.
- */
-function matchesClassBoundPolicy(
-	signedComponents: string[],
-	policy?: RoutePolicy,
+function entryToNormalizedSignOptions(
+	entry: CachedSignature,
+): AcceptSignatureSignOptions {
+	if (entry.signOptions) {
+		return normalizeAcceptSignatureSignOptions(entry.signOptions);
+	}
+
+	return normalizeAcceptSignatureSignOptions({
+		binding:
+			entry.binding ?? (entry.requestKey ? "request-bound" : "class-bound"),
+		replay: "replayable",
+		components: entry.components,
+	});
+}
+
+function matchesCachedSignature(
+	entry: CachedSignature,
+	targetSignOptions: AcceptSignatureSignOptions,
+	requestKey: string,
 ): boolean {
-	if (!policy?.classBoundPolicies || policy.classBoundPolicies.length === 0)
-		return true;
+	const entryOptions = entryToNormalizedSignOptions(entry);
 
-	const policies: string[][] = Array.isArray(policy.classBoundPolicies[0])
-		? (policy.classBoundPolicies as string[][])
-		: [policy.classBoundPolicies as string[]];
+	if (entryOptions.replay !== targetSignOptions.replay) {
+		return false;
+	}
 
-	return policies.some((required) =>
-		required.every((comp) => signedComponents.includes(comp)),
+	if (targetSignOptions.binding === "request-bound") {
+		return (
+			entryOptions.binding === "request-bound" &&
+			entry.requestKey === requestKey
+		);
+	}
+
+	if (entryOptions.binding !== "class-bound") {
+		return false;
+	}
+
+	return targetSignOptions.components.every((component) =>
+		entryOptions.components.includes(component),
 	);
 }
 
@@ -209,10 +178,6 @@ function buildFullUrl(base: string, path: string): string {
 	return `${b}${p}`;
 }
 
-type RequestInitWithDuplex = RequestInit & {
-	duplex?: "half" | "full";
-};
-
 function createLocalStorageAdapter(prefix: string): Erc8128SignatureStore {
 	return {
 		get(keyId) {
@@ -220,7 +185,6 @@ function createLocalStorageAdapter(prefix: string): Erc8128SignatureStore {
 				const raw = localStorage.getItem(`${prefix}:sig:${keyId}`);
 				if (!raw) return null;
 				const parsed = JSON.parse(raw);
-				// Migrate single-entry format → array
 				return Array.isArray(parsed) ? parsed : [parsed];
 			} catch {
 				return null;
@@ -229,16 +193,12 @@ function createLocalStorageAdapter(prefix: string): Erc8128SignatureStore {
 		set(keyId, entries) {
 			try {
 				localStorage.setItem(`${prefix}:sig:${keyId}`, JSON.stringify(entries));
-			} catch {
-				/* quota exceeded or restricted context */
-			}
+			} catch {}
 		},
 		delete(keyId) {
 			try {
 				localStorage.removeItem(`${prefix}:sig:${keyId}`);
-			} catch {
-				/* ignore */
-			}
+			} catch {}
 		},
 	};
 }
@@ -249,16 +209,11 @@ function resolveStore(
 	const raw = options.storage;
 	if (raw === false) return null;
 	if (typeof raw === "object") return raw;
-	// raw === "localStorage" or undefined → auto-detect
 	if (typeof localStorage !== "undefined") {
 		return createLocalStorageAdapter(options.storagePrefix ?? "erc8128");
 	}
 	return null;
 }
-
-// ---------------------------------------------------------------------------
-// Plugin
-// ---------------------------------------------------------------------------
 
 export const erc8128Client = (options?: Erc8128ClientOptions) => {
 	if (!options?.signer) {
@@ -267,6 +222,8 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 			$InferServerPlugin: {} as ReturnType<typeof erc8128>,
 		} satisfies BetterAuthClientPlugin;
 	}
+
+	const clientOptions = options;
 
 	const {
 		signer: _signer,
@@ -277,7 +234,7 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 		...forwardedSignOptions
 	} = options;
 
-	const store = resolveStore(options);
+	const store = resolveStore(clientOptions);
 	const margin = expiryMarginSec ?? DEFAULT_EXPIRY_MARGIN_SEC;
 	const replay: ReplayMode = preferReplayable ? "replayable" : "non-replayable";
 
@@ -285,13 +242,11 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 	let signerClient: SignerClient | null = null;
 	let signerKey = "";
 
-	// -- signer resolution ---------------------------------------------------
-
 	function resolveSigner(): EthHttpSigner | null {
-		if (typeof options!.signer === "function") {
-			return options!.signer() ?? null;
+		if (typeof clientOptions.signer === "function") {
+			return clientOptions.signer() ?? null;
 		}
-		return options!.signer ?? null;
+		return clientOptions.signer ?? null;
 	}
 
 	function getClient(signer: EthHttpSigner): SignerClient {
@@ -309,7 +264,100 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 		return formatKeyId(signer.chainId, signer.address);
 	}
 
-	// -- plugin return -------------------------------------------------------
+	function computeInitialSignOptions(
+		request: Request,
+	): AcceptSignatureSignOptions {
+		const posture = resolvePosture(
+			request.method,
+			new URL(request.url).pathname,
+			serverConfig,
+			{ ...forwardedSignOptions, replay },
+		);
+
+		return normalizeAcceptSignatureSignOptions({
+			binding: posture.binding,
+			replay: posture.replay,
+			components: posture.components,
+		});
+	}
+
+	async function signWithOptions(args: {
+		request: Request;
+		client: SignerClient;
+		keyId: string;
+		store: Erc8128SignatureStore | null;
+		margin: number;
+		signOptions: AcceptSignatureSignOptions;
+	}): Promise<SignedRequestResult> {
+		const { request, client, keyId, store, margin, signOptions } = args;
+		const useCache = signOptions.replay === "replayable";
+		const requestKey = useCache
+			? await createRequestFingerprint(request.clone())
+			: "";
+		const now = Math.floor(Date.now() / 1000);
+		let validEntries: CachedSignature[] | null = null;
+
+		if (useCache && store) {
+			const all = await store.get(keyId);
+			if (all && all.length > 0) {
+				validEntries = all.filter((entry) => entry.expires - margin > now);
+				if (validEntries.length < all.length) {
+					if (validEntries.length > 0) {
+						await store.set(keyId, validEntries);
+					} else {
+						await store.delete(keyId);
+						validEntries = null;
+					}
+				}
+
+				const match = validEntries?.find((entry) =>
+					matchesCachedSignature(entry, signOptions, requestKey),
+				);
+				if (match) {
+					const headers = new Headers(request.headers);
+					headers.set("signature", match.signature);
+					headers.set("signature-input", match.signatureInput);
+					return {
+						headers,
+						signature: match.signature,
+						signatureInput: match.signatureInput,
+					};
+				}
+			}
+		}
+
+		const signedReq = await client.signRequest(request.clone(), signOptions);
+		const signature = signedReq.headers.get("signature");
+		const signatureInput = signedReq.headers.get("signature-input");
+		if (!signature || !signatureInput) {
+			return {
+				headers: new Headers(request.headers),
+				signature: "",
+				signatureInput: "",
+			};
+		}
+
+		const parsedInput = parseSignatureInputHeader(signatureInput)[0];
+		const headers = new Headers(request.headers);
+		headers.set("signature", signature);
+		headers.set("signature-input", signatureInput);
+
+		if (useCache && store && parsedInput) {
+			const entry: CachedSignature = {
+				signature,
+				signatureInput,
+				expires: parsedInput.params.expires,
+				signOptions,
+				binding: signOptions.binding,
+				requestKey:
+					signOptions.binding === "request-bound" ? requestKey : undefined,
+				components: parsedInput.components,
+			};
+			await store.set(keyId, [...(validEntries ?? []), entry]);
+		}
+
+		return { headers, signature, signatureInput };
+	}
 
 	return {
 		id: "erc8128",
@@ -321,7 +369,6 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 		) => {
 			$fetch("/.well-known/erc8128", { method: "GET" })
 				.then((result) => {
-					// BetterFetch wraps responses in { data, error }
 					const response = result as { data?: Record<string, unknown> | null };
 					const payload = response.data;
 					if (payload && typeof payload.max_validity_sec === "number") {
@@ -348,7 +395,7 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 					const baseURL: string = (fetchOptions?.baseURL as string) || "";
 					const fullUrl = buildFullUrl(baseURL, url);
 
-					if (SKIP_PATHS.some((p) => fullUrl.endsWith(p))) {
+					if (SKIP_PATHS.some((path) => fullUrl.endsWith(path))) {
 						return { url, options: fetchOptions };
 					}
 
@@ -370,104 +417,121 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 						body: resolveRequestBody(fetchOptions?.body),
 						duplex: fetchOptions?.duplex,
 					};
-					const tempReq = new Request(fullUrl, requestInit);
+					const baseRequest = new Request(fullUrl, requestInit);
+					const fetchImpl =
+						(fetchOptions?.customFetchImpl as FetchEsque | undefined) ??
+						(typeof fetch === "function" ? fetch : undefined);
 
-					// Apply server config to the client so it can resolve posture
 					if (serverConfig) {
 						client.setServerConfig(parsedUrl.origin, serverConfig);
 					}
 
-					// Resolve posture for cache decision only — the client handles
-					// posture resolution internally when signing.
-					const posture = resolvePosture(
-						method,
-						parsedUrl.pathname,
-						serverConfig,
-						{ ...forwardedSignOptions, replay },
-					);
-					const useCache = posture.replay === "replayable";
-					const requestKey = useCache
-						? await createRequestFingerprint(tempReq)
-						: "";
+					const initialSignOptions = computeInitialSignOptions(baseRequest);
+					const initialSignedRequest = await signWithOptions({
+						request: baseRequest,
+						client,
+						keyId,
+						store,
+						margin,
+						signOptions: initialSignOptions,
+					});
+					if (
+						!initialSignedRequest.signature ||
+						!initialSignedRequest.signatureInput
+					) {
+						return { url, options: fetchOptions };
+					}
 
-					// Resolve route policy for cache matching (supports
-					// list-of-lists classBoundPolicies alternatives)
-					const routePolicy =
-						useCache && serverConfig?.route_policies
-							? matchRoutePolicy(
-									method,
-									parsedUrl.pathname,
-									serverConfig.route_policies,
-								)
-							: undefined;
-
-					// Try cache for replayable routes. Request-bound entries are
-					// reusable only for the same request fingerprint.
-					const now = Math.floor(Date.now() / 1000);
-					let validEntries: CachedSignature[] | null = null;
-
-					if (useCache && store) {
-						const all = await store.get(keyId);
-						if (all && all.length > 0) {
-							// Drop expired entries
-							validEntries = all.filter((e) => e.expires - margin > now);
-							if (validEntries.length < all.length) {
-								// Persist the pruned list (or delete if empty)
-								if (validEntries.length > 0) {
-									await store.set(keyId, validEntries);
-								} else {
-									await store.delete(keyId);
-									validEntries = null;
-								}
+					const customFetchImpl =
+						fetchImpl &&
+						(async (input: RequestInfo | URL, init?: RequestInit) => {
+							const firstResponse = await fetchImpl(input, init);
+							if (firstResponse.status !== 401) {
+								return firstResponse;
 							}
 
-							// Find a reusable entry for this request.
-							const match = validEntries?.find((e) =>
-								matchesCachedSignature(e, routePolicy, requestKey),
-							);
-							if (match) {
-								const headers = new Headers(
-									(fetchOptions?.headers as HeadersInit) || {},
+							const acceptSignature =
+								firstResponse.headers.get("accept-signature");
+							if (!acceptSignature) {
+								return firstResponse;
+							}
+
+							try {
+								const parsed = parseAcceptSignatureHeader(
+									acceptSignature,
+									baseRequest.clone(),
 								);
-								headers.set("signature", match.signature);
-								headers.set("signature-input", match.signatureInput);
-								return { url, options: { ...fetchOptions, headers } };
+								const retrySignOptions = selectAcceptSignatureRetryOptions({
+									members: parsed,
+									requestShape: baseRequest.clone(),
+									attemptedOptions: [initialSignOptions],
+								});
+
+								if (!retrySignOptions) {
+									return firstResponse;
+								}
+
+								const normalizedRetrySignOptions =
+									normalizeAcceptSignatureSignOptions(retrySignOptions);
+								if (
+									normalizedRetrySignOptions.binding ===
+										initialSignOptions.binding &&
+									normalizedRetrySignOptions.replay ===
+										initialSignOptions.replay &&
+									arraysEqual(
+										normalizedRetrySignOptions.components,
+										initialSignOptions.components,
+									)
+								) {
+									return firstResponse;
+								}
+
+								let response = firstResponse;
+								for (
+									let attempt = 0;
+									attempt < MAX_ACCEPT_SIGNATURE_RETRIES;
+									attempt++
+								) {
+									const retriedRequest = await signWithOptions({
+										request: baseRequest,
+										client,
+										keyId,
+										store,
+										margin,
+										signOptions: normalizedRetrySignOptions,
+									});
+									if (
+										!retriedRequest.signature ||
+										!retriedRequest.signatureInput
+									) {
+										return firstResponse;
+									}
+
+									const retryHeaders = new Headers(baseRequest.headers);
+									retryHeaders.set("signature", retriedRequest.signature);
+									retryHeaders.set(
+										"signature-input",
+										retriedRequest.signatureInput,
+									);
+									const retryRequest = new Request(baseRequest.clone(), {
+										headers: retryHeaders,
+									});
+									response = await fetchImpl(retryRequest.clone());
+								}
+								return response;
+							} catch {
+								return firstResponse;
 							}
-						}
-					}
+						});
 
-					const signedReq = await client.signRequest(tempReq);
-
-					const sig = signedReq.headers.get("signature");
-					const sigInput = signedReq.headers.get("signature-input");
-					if (!sig || !sigInput) return { url, options: fetchOptions };
-
-					const headers = new Headers(
-						(fetchOptions?.headers as HeadersInit) || {},
-					);
-					headers.set("signature", sig);
-					headers.set("signature-input", sigInput);
-
-					// Cache replayable signatures. Request-bound entries carry an
-					// exact request fingerprint so they are only reused when safe.
-					if (useCache && store) {
-						const expires = parseExpiresFromSignatureInput(sigInput);
-						if (expires) {
-							const entry: CachedSignature = {
-								signature: sig,
-								signatureInput: sigInput,
-								expires,
-								binding: posture.binding,
-								requestKey:
-									posture.binding === "request-bound" ? requestKey : undefined,
-								components: parseComponentsFromSignatureInput(sigInput),
-							};
-							const updated = [...(validEntries ?? []), entry];
-							await store.set(keyId, updated);
-						}
-					}
-
-					return { url, options: { ...fetchOptions, headers } };
+					return {
+						url,
+						options: {
+							...fetchOptions,
+							headers: initialSignedRequest.headers,
+							...(customFetchImpl ? { customFetchImpl } : {}),
+						},
+					};
 				},
 			},
 		],
