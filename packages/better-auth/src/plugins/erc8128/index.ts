@@ -8,8 +8,9 @@ import {
 } from "@better-auth/core/api";
 import type { Session } from "@better-auth/core/db";
 import type {
+	DiscoveryDocumentConfig,
+	RoutePolicy,
 	VerifyMessageFn,
-	VerifyPolicy,
 	VerifyResult,
 } from "@slicekit/erc8128";
 import {
@@ -38,7 +39,11 @@ import {
 	createMemoryNonceStore,
 	createSecondaryStorageNonceStore,
 } from "./nonce-store";
-import { isPluginEndpoint, resolveRoutePolicy } from "./route-policy";
+import {
+	isPluginEndpoint,
+	normalizeRoutePolicyConfig,
+	resolveRoutePolicy,
+} from "./route-policy";
 import type { ERC8128Schema } from "./schema";
 import { schema } from "./schema";
 import type { ENSLookupArgs, ENSLookupResult, WalletAddress } from "./types";
@@ -68,6 +73,24 @@ declare module "@better-auth/core" {
 	}
 }
 
+const ERC8128_VERIFICATION_CONTEXT_KEY = "__erc8128Verification";
+
+export type Erc8128VerifiedRequest = Extract<VerifyResult, { ok: true }>;
+
+type Erc8128ContextCarrier = {
+	context?: Record<string, unknown>;
+};
+
+export function getErc8128Verification(
+	ctx: Erc8128ContextCarrier,
+): Erc8128VerifiedRequest | null {
+	const value = ctx.context?.[ERC8128_VERIFICATION_CONTEXT_KEY];
+	if (!value || typeof value !== "object") {
+		return null;
+	}
+	return value as Erc8128VerifiedRequest;
+}
+
 export interface ERC8128PluginOptions {
 	verifyMessage: VerifyMessageFn;
 	sessionExpiresIn?: number | undefined;
@@ -85,11 +108,15 @@ export interface ERC8128PluginOptions {
 	 * @default 10000
 	 */
 	cacheSize?: number | undefined;
-	routePolicy?:
-		| (Record<string, VerifyPolicy | false> & {
-				default?: VerifyPolicy;
-		  })
-		| undefined;
+	/**
+	 * Per-route policy map keyed by Better Auth endpoint paths relative to the
+	 * auth `basePath` (for example `"/get-session"` or `"/erc8128/verify"`).
+	 *
+	 * The plugin strips Better Auth's mount prefix automatically, so users do
+	 * not need to include `/api/auth` (or a custom `basePath`) in keys. Legacy
+	 * basePath-prefixed keys are still accepted and normalized internally.
+	 */
+	routePolicy?: DiscoveryDocumentConfig["routePolicy"] | undefined;
 	/**
 	 * When `secondaryStorage` is configured, nonces and invalidation records
 	 * are stored there by default (with TTL-based auto-cleanup). Set this to
@@ -139,11 +166,18 @@ function extractKeyIdFromSignatureInput(signatureInput: string): string | null {
 }
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
+	const allowsReplayable = (
+		policy: RoutePolicy | RoutePolicy[] | false | undefined,
+	): boolean =>
+		(Array.isArray(policy) ? policy : [policy]).some(
+			(entry) => entry !== false && entry?.replayable === true,
+		);
+
 	const replayableEnabled =
-		options.routePolicy?.default?.replayable === true ||
+		allowsReplayable(options.routePolicy?.default) ||
 		(options.routePolicy != null &&
-			Object.values(options.routePolicy).some(
-				(p) => typeof p === "object" && p !== null && p.replayable === true,
+			Object.values(options.routePolicy).some((policy) =>
+				allowsReplayable(policy),
 			));
 
 	const fallbackCacheMap = new Map<string, CacheValue>();
@@ -457,14 +491,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								return false;
 							}
 
-							const resolvedRoutePolicy = resolveRoutePolicy(
-								options.routePolicy,
-								context.request,
-							);
-							if (
-								resolvedRoutePolicy.requireAuth &&
-								!resolvedRoutePolicy.skipVerification
-							) {
+							if (options.routePolicy) {
 								return true;
 							}
 						}
@@ -505,7 +532,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						}
 
 						const resolvedRoutePolicy = ctx.request
-							? resolveRoutePolicy(options.routePolicy, ctx.request)
+							? resolveRoutePolicy(
+									options.routePolicy,
+									ctx.request,
+									ctx.context.baseURL,
+								)
 							: ({
 									policy: undefined,
 									requireAuth: false,
@@ -607,11 +638,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							verifyMessage: createCachedVerifyMessage(ctx),
 							nonceStore: getNonceStore(ctx),
 							defaults: {
-								...options.routePolicy?.default,
 								maxValiditySec: options.maxValiditySec,
 								clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
 								maxSignatureVerifications: MAX_SIGNATURE_VERIFICATIONS,
-								replayable: options.routePolicy?.default?.replayable ?? false,
 								...(replayableEnabled
 									? {
 											replayableNotBefore: async (keyid: string) => {
@@ -691,6 +720,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							);
 						}
 
+						(ctx.context as typeof ctx.context & Record<string, unknown>)[
+							ERC8128_VERIFICATION_CONTEXT_KEY
+						] = result;
+
 						const walletAddress = result.address;
 						const chainId = result.chainId;
 						const walletUser = await findOrCreateWalletUser(
@@ -768,7 +801,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									? `${baseURL}/erc8128/invalidate`
 									: undefined,
 							maxValiditySec: options.maxValiditySec,
-							routePolicy: options.routePolicy,
+							routePolicy: options.routePolicy
+								? normalizeRoutePolicyConfig(options.routePolicy, baseURL)
+								: undefined,
 						}),
 						capabilities: {
 							persistent_storage: storageMode !== "none",

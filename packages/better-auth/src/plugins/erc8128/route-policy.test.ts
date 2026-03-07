@@ -5,102 +5,166 @@ function fakeRequest(method: string, path: string): Request {
 	return new Request(`https://example.com${path}`, { method });
 }
 
-describe("resolveRoutePolicy — multi-method keys", () => {
-	const policy = { replayable: false } as const;
-
-	it("matches comma-separated methods to a single path", () => {
-		const routePolicy = { "POST,GET,PUT /api/orders": policy };
+describe("resolveRoutePolicy", () => {
+	it("matches exact paths with method-specific entries", () => {
+		const routePolicy = {
+			"/api/orders": [
+				{ methods: ["POST"], replayable: false },
+				{ methods: ["GET"], replayable: true },
+			],
+		};
 
 		const post = resolveRoutePolicy(
 			routePolicy,
 			fakeRequest("POST", "/api/orders"),
 		);
-		expect(post.requireAuth).toBe(true);
-
 		const get = resolveRoutePolicy(
 			routePolicy,
 			fakeRequest("GET", "/api/orders"),
 		);
-		expect(get.requireAuth).toBe(true);
 
-		const put = resolveRoutePolicy(
-			routePolicy,
-			fakeRequest("PUT", "/api/orders"),
-		);
-		expect(put.requireAuth).toBe(true);
-	});
-
-	it("does not match unlisted methods", () => {
-		const routePolicy = { "POST,GET /api/orders": policy };
-
-		const del = resolveRoutePolicy(
-			routePolicy,
-			fakeRequest("DELETE", "/api/orders"),
-		);
-		expect(del.requireAuth).toBe(false);
-	});
-
-	it("works with wildcards in the path", () => {
-		const routePolicy = { "GET,POST /api/items/*": policy };
-
-		const get = resolveRoutePolicy(
-			routePolicy,
-			fakeRequest("GET", "/api/items/123"),
-		);
-		expect(get.requireAuth).toBe(true);
-
-		const post = resolveRoutePolicy(
-			routePolicy,
-			fakeRequest("POST", "/api/items/456"),
-		);
 		expect(post.requireAuth).toBe(true);
-
-		const put = resolveRoutePolicy(
-			routePolicy,
-			fakeRequest("PUT", "/api/items/789"),
-		);
-		expect(put.requireAuth).toBe(false);
+		expect(post.policy?.replayable).toBe(false);
+		expect(get.requireAuth).toBe(true);
+		expect(get.policy?.replayable).toBe(true);
 	});
 
-	it("supports false to skip verification for multiple methods", () => {
-		const routePolicy = { "GET,POST /api/public": false as const };
+	it("falls back to the methodless entry on the same path", () => {
+		const routePolicy = {
+			"/api/orders": [
+				{ methods: ["POST"], replayable: false },
+				{ replayable: true },
+			],
+		};
 
-		const get = resolveRoutePolicy(
+		const resolved = resolveRoutePolicy(
+			routePolicy,
+			fakeRequest("GET", "/api/orders"),
+		);
+
+		expect(resolved.requireAuth).toBe(true);
+		expect(resolved.policy?.replayable).toBe(true);
+	});
+
+	it("does not fall through to default when a matched path has no applicable method", () => {
+		const routePolicy = {
+			"/api/orders": [{ methods: ["POST"], replayable: false }],
+			default: { replayable: true },
+		};
+
+		const resolved = resolveRoutePolicy(
+			routePolicy,
+			fakeRequest("GET", "/api/orders"),
+		);
+
+		expect(resolved.requireAuth).toBe(false);
+		expect(resolved.skipVerification).toBe(false);
+		expect(resolved.policy).toBeUndefined();
+	});
+
+	it("matches the longest wildcard path", () => {
+		const routePolicy = {
+			"/api/*": { replayable: true },
+			"/api/orders/*": { replayable: false },
+		};
+
+		const resolved = resolveRoutePolicy(
+			routePolicy,
+			fakeRequest("GET", "/api/orders/123"),
+		);
+
+		expect(resolved.requireAuth).toBe(true);
+		expect(resolved.policy?.replayable).toBe(false);
+	});
+
+	it("supports false to skip verification on exact paths", () => {
+		const routePolicy = {
+			"/api/public": false as const,
+			default: { replayable: false },
+		};
+
+		const resolved = resolveRoutePolicy(
 			routePolicy,
 			fakeRequest("GET", "/api/public"),
 		);
-		expect(get.skipVerification).toBe(true);
 
-		const post = resolveRoutePolicy(
-			routePolicy,
-			fakeRequest("POST", "/api/public"),
-		);
-		expect(post.skipVerification).toBe(true);
+		expect(resolved.skipVerification).toBe(true);
+		expect(resolved.requireAuth).toBe(false);
 	});
 
-	it("handles spaces around commas", () => {
-		const routePolicy = { "GET , POST /api/orders": policy };
+	it("supports false to skip verification on wildcard paths", () => {
+		const routePolicy = {
+			"/api/public/*": false as const,
+			default: { replayable: false },
+		};
 
-		const get = resolveRoutePolicy(
+		const resolved = resolveRoutePolicy(
 			routePolicy,
-			fakeRequest("GET", "/api/orders"),
+			fakeRequest("GET", "/api/public/asset"),
 		);
-		expect(get.requireAuth).toBe(true);
 
-		const post = resolveRoutePolicy(
-			routePolicy,
-			fakeRequest("POST", "/api/orders"),
-		);
-		expect(post.requireAuth).toBe(true);
+		expect(resolved.skipVerification).toBe(true);
+		expect(resolved.requireAuth).toBe(false);
 	});
 
-	it("case-insensitive method matching via uppercase normalization", () => {
-		const routePolicy = { "get,post /api/orders": policy };
+	it("uses default when no path entry matches", () => {
+		const routePolicy = {
+			default: {
+				replayable: true,
+				classBoundPolicies: [["@authority"]],
+			},
+		};
 
-		const get = resolveRoutePolicy(
+		const resolved = resolveRoutePolicy(
 			routePolicy,
-			fakeRequest("GET", "/api/orders"),
+			fakeRequest("POST", "/api/other"),
 		);
-		expect(get.requireAuth).toBe(true);
+
+		expect(resolved.requireAuth).toBe(true);
+		expect(resolved.policy).toEqual(routePolicy.default);
+	});
+
+	it("uses a single object value as an all-method path policy", () => {
+		const routePolicy = {
+			"/api/orders": { replayable: false },
+		};
+
+		const resolved = resolveRoutePolicy(
+			routePolicy,
+			fakeRequest("DELETE", "/api/orders"),
+		);
+
+		expect(resolved.requireAuth).toBe(true);
+		expect(resolved.policy?.replayable).toBe(false);
+	});
+
+	it("matches auth-relative paths when Better Auth uses a custom basePath", () => {
+		const routePolicy = {
+			"/session": { replayable: false },
+		};
+
+		const resolved = resolveRoutePolicy(
+			routePolicy,
+			fakeRequest("GET", "/custom-auth/session"),
+			"http://example.com/custom-auth",
+		);
+
+		expect(resolved.requireAuth).toBe(true);
+		expect(resolved.policy?.replayable).toBe(false);
+	});
+
+	it("accepts legacy basePath-prefixed route keys and normalizes them", () => {
+		const routePolicy = {
+			"/custom-auth/session": { replayable: false },
+		};
+
+		const resolved = resolveRoutePolicy(
+			routePolicy,
+			fakeRequest("GET", "/custom-auth/session"),
+			"http://example.com/custom-auth",
+		);
+
+		expect(resolved.requireAuth).toBe(true);
+		expect(resolved.policy?.replayable).toBe(false);
 	});
 });

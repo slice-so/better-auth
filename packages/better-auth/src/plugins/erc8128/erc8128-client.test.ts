@@ -745,7 +745,10 @@ describe("erc8128Client", () => {
 							replayable: true,
 							classBoundPolicies: ["@authority"],
 						},
-						"POST /api/auth/erc8128/invalidate": { replayable: false },
+						"/erc8128/invalidate": {
+							methods: ["POST"],
+							replayable: false,
+						},
 					},
 				},
 			});
@@ -773,7 +776,10 @@ describe("erc8128Client", () => {
 							replayable: true,
 							classBoundPolicies: ["@authority"],
 						},
-						"GET /api/auth/admin/*": { replayable: false },
+						"/admin/*": {
+							methods: ["GET"],
+							replayable: false,
+						},
 					},
 				},
 			});
@@ -782,6 +788,34 @@ describe("erc8128Client", () => {
 			await init("/admin/users", { baseURL: BASE_URL, method: "GET" });
 
 			expect(store.set).not.toHaveBeenCalled();
+		});
+
+		it("resolves route policy against the auth-relative path for custom basePath deployments", async () => {
+			const store = createMockStore();
+			const { plugin } = await setupPluginWithConfig({
+				preferReplayable: true,
+				binding: "class-bound",
+				components: [],
+				storage: store,
+				config: {
+					max_validity_sec: 300,
+					route_policies: {
+						"/session": {
+							methods: ["GET"],
+							replayable: true,
+							classBoundPolicies: ["@authority"],
+						},
+					},
+				},
+			});
+			const init = getInitHook(plugin);
+
+			await init("/session", {
+				baseURL: "http://localhost:3000/custom-auth",
+				method: "GET",
+			});
+
+			expect(store.set).toHaveBeenCalledOnce();
 		});
 
 		it("uses cached signature on second request (skips signRequest)", async () => {
@@ -961,7 +995,8 @@ describe("erc8128Client", () => {
 				config: {
 					max_validity_sec: 300,
 					route_policies: {
-						"GET /api/auth/session": {
+						"/session": {
+							methods: ["GET"],
 							replayable: true,
 							classBoundPolicies: ["@method", "@authority"],
 						},
@@ -1004,7 +1039,8 @@ describe("erc8128Client", () => {
 					max_validity_sec: 300,
 					route_policies: {
 						// Route requires @method + @authority + @target-uri
-						"GET /api/auth/session": {
+						"/session": {
+							methods: ["GET"],
 							replayable: true,
 							classBoundPolicies: ["@method", "@authority", "@target-uri"],
 						},
@@ -1051,7 +1087,8 @@ describe("erc8128Client", () => {
 				config: {
 					max_validity_sec: 300,
 					route_policies: {
-						"GET /api/auth/session": {
+						"/session": {
+							methods: ["GET"],
 							replayable: true,
 							classBoundPolicies: ["@method", "@authority"],
 						},
@@ -1120,7 +1157,8 @@ describe("erc8128Client", () => {
 				config: {
 					max_validity_sec: 300,
 					route_policies: {
-						"GET /api/auth/session": {
+						"/session": {
+							methods: ["GET"],
 							replayable: true,
 							// list-of-lists: first requires @method+@target-uri,
 							// second requires @method+@authority — cached satisfies second

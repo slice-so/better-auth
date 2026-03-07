@@ -26,6 +26,7 @@ import {
 	selectAcceptSignatureRetryOptions,
 } from "@slicekit/erc8128";
 import type { erc8128 } from ".";
+import { getRoutePolicyPathname } from "./route-policy";
 
 export interface CachedSignature {
 	signature: string;
@@ -266,10 +267,11 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 
 	function computeInitialSignOptions(
 		request: Request,
+		authBaseURL?: string,
 	): AcceptSignatureSignOptions {
 		const posture = resolvePosture(
 			request.method,
-			new URL(request.url).pathname,
+			getRoutePolicyPathname(request, authBaseURL),
 			serverConfig,
 			{ ...forwardedSignOptions, replay },
 		);
@@ -426,7 +428,10 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 						client.setServerConfig(parsedUrl.origin, serverConfig);
 					}
 
-					const initialSignOptions = computeInitialSignOptions(baseRequest);
+					const initialSignOptions = computeInitialSignOptions(
+						baseRequest,
+						baseURL || undefined,
+					);
 					const initialSignedRequest = await signWithOptions({
 						request: baseRequest,
 						client,

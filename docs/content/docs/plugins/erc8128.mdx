@@ -120,6 +120,10 @@ When any request to `auth.handler` carries ERC-8128 signature headers (`Signatur
   The middleware only runs for requests routed through `auth.handler`. For custom routes outside Better Auth, use `verifyRequest()` from `@slicekit/erc8128` directly.
 </Callout>
 
+<Callout>
+  For custom Better Auth or Better Call endpoints that both parse a request body and rely on ERC-8128 verification, set `cloneRequest: true`. Verification may need the original request bytes; without cloning, body parsing can consume the stream before downstream code or signature validation reads it.
+</Callout>
+
 ## Signing Model
 
 The signer always controls the security posture of each signature — whether it includes a nonce (non-replayable) or omits it (replayable), and whether it covers the full request (request-bound) or only selected components like method and path (class-bound).
@@ -130,16 +134,22 @@ The server controls what it *accepts*: `routePolicy` declares which routes allow
 
 Use `routePolicy` to declare which routes require authentication and what signature postures the server accepts.
 
+Paths are defined **relative to Better Auth's `basePath`**. With the default mount this means you write `"/session"` instead of `"/api/auth/session"`. If your app uses a custom `basePath`, the plugin strips it automatically. Legacy basePath-prefixed keys are still accepted for compatibility.
+
 ```ts title="auth.ts"
 erc8128({
   verifyMessage: publicClient.verifyMessage,
   routePolicy: {
-    "GET /api/products/*": {
+    "/products/*": {
+      methods: ["GET"],
       replayable: true,
       classBoundPolicies: ["@method", "@path"], // require at least these + @authority
     },
-    "POST,PUT /api/orders": { replayable: false },
-    "GET /api/public/*": false, // skip verification entirely
+    "/orders": [
+      { methods: ["POST"], replayable: false },
+      { methods: ["PUT"], replayable: false },
+    ],
+    "/public/*": false, // skip verification entirely
     default: { replayable: false }, // require auth on all other routes
   },
 });
@@ -147,13 +157,58 @@ erc8128({
 
 Matching order:
 
-1. Exact match on `"METHOD /path"`.
-2. Comma-separated methods expand into individual matches — `"POST,PUT /api/orders"` matches both `POST` and `PUT`.
-3. Wildcard match (`*`).
-4. `default` policy (if set).
-5. No match + no default → opportunistic (passthrough on failure).
+1. Exact path match (`"/path"`).
+2. Longest wildcard path match (`"/path/*"`).
+3. `default` policy (if set).
+4. No match + no default → opportunistic (passthrough on failure).
 
-A value of `false` skips verification. A `VerifyPolicy` object requires verification — returning `401` on failure. Setting `replayable: true` means the server accepts both replayable and non-replayable signatures for that route. `classBoundPolicies` sets the minimum components a class-bound signature must cover.
+For a matched path:
+
+- a single object applies to all methods unless it sets `methods`
+- an array lets you declare multiple method-specific variants on the same path
+- method-specific entries are preferred over methodless entries on that same path
+- if a path matches but none of its method-specific entries apply and there is no methodless fallback for that path, `default` is not consulted
+
+A value of `false` skips verification. A `RoutePolicy` object requires verification — returning `401` on failure. Setting `replayable: true` means the server accepts both replayable and non-replayable signatures for that route. `classBoundPolicies` sets the minimum components a class-bound signature must cover.
+
+Protected routes always allow **request-bound** signatures. `routePolicy` only controls whether weaker postures are additionally accepted:
+
+- `replayable: false`, no `classBoundPolicies`
+  - only non-replayable, request-bound signatures
+- `replayable: true`, no `classBoundPolicies`
+  - request-bound signatures, replayable or non-replayable
+- `replayable: false`, `classBoundPolicies: [...]`
+  - request-bound signatures, plus non-replayable class-bound signatures
+- `replayable: true`, `classBoundPolicies: [...]`
+  - request-bound signatures, plus replayable or non-replayable class-bound signatures
+
+On a specifically matched route, `classBoundPolicies` and `additionalRequestBoundComponents` do **not** inherit from `default`.
+
+- Omitting `classBoundPolicies` on a matched route means class-bound signatures are not allowed there.
+- Omitting `additionalRequestBoundComponents` on a matched route means no extra request-bound components beyond the standard ERC-8128 request-bound set.
+
+Example:
+
+```ts title="Replayable by default, strict on one route"
+erc8128({
+  verifyMessage: publicClient.verifyMessage,
+  routePolicy: {
+    default: {
+      replayable: true,
+      classBoundPolicies: ["@authority"],
+    },
+    "/erc8128/invalidate": {
+      methods: ["POST"],
+      replayable: false,
+    },
+  },
+});
+```
+
+In that configuration:
+
+- most protected routes accept replayable or non-replayable request-bound signatures, and replayable or non-replayable class-bound signatures with at least `@authority`
+- `POST /erc8128/invalidate` accepts only non-replayable, request-bound signatures
 
 <Callout>
   Both `/erc8128/verify` and `/erc8128/invalidate` enforce non-replayable, request-bound signatures — this is not configurable.
@@ -234,6 +289,40 @@ erc8128Client({
 
 Each keyId maps to an array of cached signatures — different routes may require different class-bound components, and request-bound signatures may exist for distinct exact-request fingerprints. Expired entries are pruned automatically on each cache access. The `clearSignatureCache()` action removes all entries for the current signer.
 
+## Custom Better Auth Endpoints
+
+For custom Better Auth endpoints, the plugin exposes the successful verification result through `getErc8128Verification(ctx)`.
+
+If the endpoint parses a body, also set `cloneRequest: true` so Better Call preserves the original request for signature verification.
+
+```ts title="Custom endpoint reading the verified ERC-8128 result"
+import { createAuthEndpoint } from "@better-auth/core/api";
+import { erc8128, getErc8128Verification } from "better-auth/plugins";
+import * as z from "zod";
+
+const signedEndpoint = createAuthEndpoint(
+  "/custom/signed",
+  {
+    method: "POST",
+    body: z.object({
+      value: z.string(),
+    }),
+    cloneRequest: true,
+  },
+  async (ctx) => {
+    const verification = getErc8128Verification(ctx);
+
+    return ctx.json({
+      value: ctx.body.value,
+      signer: verification?.address ?? null,
+      keyId: verification?.params.keyid ?? null,
+      replayable: verification?.replayable ?? null,
+      binding: verification?.binding ?? null,
+    });
+  },
+);
+```
+
 ## Error Handling
 
 When verification is required and fails, the response includes:
@@ -291,7 +380,7 @@ For production deployments with multiple server instances, configure `secondaryS
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `verifyMessage` | `VerifyMessageFn` | *required* | Signature verification function (use viem's `publicClient.verifyMessage` — handles both EOA and ERC-1271 smart contract signatures). |
-| `routePolicy` | `Record<string, VerifyPolicy \| false>` | — | Per-route middleware policy map — see [Route Policy](#route-policy). |
+| `routePolicy` | `Record<string, RoutePolicy \| RoutePolicy[] \| false> & { default?: RoutePolicy }` | — | Per-route middleware policy map keyed by Better Auth paths relative to `basePath` — see [Route Policy](#route-policy). |
 | `sessionExpiresIn` | `number` | — | Session TTL in seconds (for `/erc8128/verify`). |
 | `maxValiditySec` | `number` | `300` | Maximum signature validity window (seconds). |
 | `clockSkewSec` | `number` | `30` | Allowed clock skew (seconds). |

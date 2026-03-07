@@ -1,3 +1,4 @@
+import { createAuthEndpoint } from "@better-auth/core/api";
 import type {
 	VerifyMessageFn,
 	VerifyPolicy,
@@ -5,8 +6,9 @@ import type {
 } from "@slicekit/erc8128";
 import { createVerifierClient, formatKeyId } from "@slicekit/erc8128";
 import { describe, expect, it, vi } from "vitest";
+import * as z from "zod";
 import { getTestInstance } from "../../test-utils/test-instance";
-import { erc8128 } from "./index";
+import { erc8128, getErc8128Verification } from "./index";
 import { schema as erc8128Schema } from "./schema";
 import type { WalletAddress } from "./types";
 
@@ -201,9 +203,12 @@ describe("erc8128 plugin", () => {
 					erc8128({
 						verifyMessage: async () => true,
 						routePolicy: {
-							"GET /api/products/*": { replayable: true },
-							"POST /api/orders": { replayable: false },
-							"GET /api/public/*": false,
+							"/products/*": {
+								methods: ["GET"],
+								replayable: true,
+							},
+							"/orders": { methods: ["POST"], replayable: false },
+							"/public/*": false,
 							default: { replayable: false },
 						},
 					}),
@@ -213,8 +218,9 @@ describe("erc8128 plugin", () => {
 			const { response, data } = await get(auth, "/.well-known/erc8128");
 			expect(response.status).toBe(200);
 			expect(data.route_policies).toEqual({
-				"GET /api/products/*": { replayable: true },
-				"POST /api/orders": { replayable: false },
+				"/products/*": { methods: ["GET"], replayable: true },
+				"/orders": { methods: ["POST"], replayable: false },
+				default: { replayable: false },
 			});
 		});
 	});
@@ -397,6 +403,72 @@ describe("erc8128 plugin", () => {
 			const { response, data } = await post(auth, "/erc8128/verify");
 			expect(response.status).toBe(200);
 			expect(data.success).toBe(true);
+		});
+	});
+
+	describe("downstream verification context", () => {
+		it("exposes the verified ERC-8128 result to custom Better Auth endpoints", async () => {
+			mockVerifier(async () => okResult({ replayable: false }));
+
+			const endpointPlugin = {
+				id: "erc8128-test-endpoint",
+				endpoints: {
+					readVerifiedSignature: createAuthEndpoint(
+						"/custom/signed",
+						{
+							method: "POST",
+							body: z.object({
+								value: z.string(),
+							}),
+							cloneRequest: true,
+						},
+						async (ctx) => {
+							const verification = getErc8128Verification(ctx);
+							return ctx.json({
+								value: ctx.body.value,
+								verification,
+							});
+						},
+					),
+				},
+			};
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							"/custom/signed": {
+								methods: ["POST"],
+								replayable: false,
+							},
+						},
+					}),
+					endpointPlugin,
+				],
+			});
+
+			const response = await auth.handler(
+				new Request("http://localhost:3000/api/auth/custom/signed", {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						signature: "sig1=:bW9jaw==:",
+						"signature-input": `sig1=("@method" "@target-uri" "@authority");created=1;expires=301;keyid="${formatKeyId(defaultChainId, defaultAddress)}";nonce="nonce-1"`,
+					},
+					body: JSON.stringify({ value: "ok" }),
+				}),
+			);
+			const data = await response.json();
+
+			expect(response.status).toBe(200);
+			expect(data.value).toBe("ok");
+			expect(data.verification).toMatchObject({
+				ok: true,
+				address: defaultAddress,
+				chainId: defaultChainId,
+				replayable: false,
+			});
 		});
 	});
 
@@ -606,7 +678,10 @@ describe("erc8128 plugin", () => {
 					erc8128({
 						verifyMessage: async () => true,
 						routePolicy: {
-							"GET /api/auth/get-session": { replayable: false },
+							"/get-session": {
+								methods: ["GET"],
+								replayable: false,
+							},
 						},
 					}),
 				],
@@ -633,7 +708,10 @@ describe("erc8128 plugin", () => {
 					erc8128({
 						verifyMessage: async () => true,
 						routePolicy: {
-							"GET /api/auth/get-session": { replayable: false },
+							"/get-session": {
+								methods: ["GET"],
+								replayable: false,
+							},
 						},
 					}),
 				],
@@ -660,7 +738,7 @@ describe("erc8128 plugin", () => {
 					erc8128({
 						verifyMessage: async () => true,
 						routePolicy: {
-							"GET /api/auth/*": false,
+							"/*": false,
 						},
 					}),
 				],
@@ -857,7 +935,10 @@ describe("erc8128 plugin", () => {
 					erc8128({
 						verifyMessage: async () => true,
 						routePolicy: {
-							"POST /api/auth/erc8128/verify": { replayable: false },
+							"/erc8128/verify": {
+								methods: ["POST"],
+								replayable: false,
+							},
 						},
 					}),
 				],
