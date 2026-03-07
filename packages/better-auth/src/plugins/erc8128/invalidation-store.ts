@@ -238,8 +238,14 @@ export function createSecondaryStorageInvalidationOps(
 export function createMemoryInvalidationOps(
 	defaultTtlSec: number = DEFAULT_INVALIDATION_TTL_SEC,
 ): InvalidationOps {
-	const keyIdStore = new Map<string, { notBefore: number; expiresAt: number }>();
-	const sigStore = new Map<string, { record: InvalidationRecord; expiresAt: number }>();
+	const keyIdStore = new Map<
+		string,
+		{ notBefore: number; expiresAt: number }
+	>();
+	const sigStore = new Map<
+		string,
+		{ record: InvalidationRecord; expiresAt: number }
+	>();
 
 	const sweep = () => {
 		const nowSec = Math.floor(Date.now() / 1000);
@@ -259,7 +265,9 @@ export function createMemoryInvalidationOps(
 			return [{ notBefore: row.notBefore }];
 		},
 
-		async findBySignature(signature: string): Promise<InvalidationRecord | null> {
+		async findBySignature(
+			signature: string,
+		): Promise<InvalidationRecord | null> {
 			sweep();
 			const row = sigStore.get(signature);
 			return row?.record ?? null;

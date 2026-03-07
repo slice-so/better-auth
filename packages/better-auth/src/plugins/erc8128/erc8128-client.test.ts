@@ -92,6 +92,24 @@ function mockSignRequestFn(opts?: {
 	});
 }
 
+function mockRequestBoundSignRequestFn(opts?: {
+	expires?: number;
+	created?: number;
+}) {
+	const created = opts?.created ?? Math.floor(Date.now() / 1000);
+	const expires = opts?.expires ?? created + 300;
+
+	return vi.fn(async (req: Request) => {
+		const headers = new Headers(req.headers);
+		headers.set("signature", "sig1=:cmVxdWVzdA==:");
+		headers.set(
+			"signature-input",
+			`sig1=("@method" "@target-uri" "@authority");created=${created};expires=${expires};keyid="${defaultKeyId}"`,
+		);
+		return new Request(req.url, { method: req.method, headers });
+	});
+}
+
 /** The mock `setServerConfig` from the last `setupMockSignerClient` call. */
 let mockSetServerConfig: ReturnType<typeof vi.fn>;
 
@@ -218,6 +236,30 @@ describe("erc8128Client", () => {
 			const headers = result.options?.headers as Headers;
 			expect(headers.get("x-custom")).toBe("value");
 			expect(headers.get("signature")).toBeTruthy();
+		});
+
+		it("passes the original request body to signRequest", async () => {
+			let seenBody = "";
+			const signFn = vi.fn(async (req: Request) => {
+				seenBody = await req.clone().text();
+				return new Request(req.url, {
+					method: req.method,
+					headers: req.headers,
+				});
+			});
+			const { plugin } = await setupPluginWithConfig({ signFn });
+			const init = getInitHook(plugin);
+
+			await init("/session", {
+				baseURL: BASE_URL,
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ hello: "world" }),
+				duplex: "half",
+			});
+
+			expect(signFn).toHaveBeenCalledOnce();
+			expect(seenBody).toBe('{"hello":"world"}');
 		});
 
 		it("skips signing when signer function returns null", async () => {
@@ -393,8 +435,10 @@ describe("erc8128Client", () => {
 			const store = createMockStore();
 			const { plugin } = await setupPluginWithConfig({
 				preferReplayable: true,
+				binding: "request-bound",
 				storage: store,
 				config: REPLAYABLE_CONFIG,
+				signFn: mockRequestBoundSignRequestFn(),
 			});
 			const init = getInitHook(plugin);
 
@@ -481,6 +525,68 @@ describe("erc8128Client", () => {
 			expect(signFn).not.toHaveBeenCalled();
 			const headers = result.options?.headers as Headers;
 			expect(headers.get("signature")).toBe("sig1=:bW9jaw==:");
+		});
+
+		it("reuses cached request-bound signatures only for the same request", async () => {
+			const store = createMockStore();
+			const { plugin, signFn } = await setupPluginWithConfig({
+				preferReplayable: true,
+				binding: "request-bound",
+				storage: store,
+				config: REPLAYABLE_CONFIG,
+				signFn: mockRequestBoundSignRequestFn(),
+			});
+			const init = getInitHook(plugin);
+
+			await init("/session?tab=profile", {
+				baseURL: BASE_URL,
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ hello: "world" }),
+			});
+			expect(signFn).toHaveBeenCalledOnce();
+
+			signFn.mockClear();
+			const result = await init("/session?tab=profile", {
+				baseURL: BASE_URL,
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ hello: "world" }),
+			});
+
+			expect(signFn).not.toHaveBeenCalled();
+			const headers = result.options?.headers as Headers;
+			expect(headers.get("signature")).toBe("sig1=:cmVxdWVzdA==:");
+		});
+
+		it("does not reuse cached request-bound signatures for a different request body", async () => {
+			const store = createMockStore();
+			const { plugin, signFn } = await setupPluginWithConfig({
+				preferReplayable: true,
+				binding: "request-bound",
+				storage: store,
+				config: REPLAYABLE_CONFIG,
+				signFn: mockRequestBoundSignRequestFn(),
+			});
+			const init = getInitHook(plugin);
+
+			await init("/session", {
+				baseURL: BASE_URL,
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ hello: "world" }),
+			});
+			expect(signFn).toHaveBeenCalledOnce();
+
+			signFn.mockClear();
+			await init("/session", {
+				baseURL: BASE_URL,
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ hello: "mars" }),
+			});
+
+			expect(signFn).toHaveBeenCalledOnce();
 		});
 
 		it("prunes expired entries and signs fresh", async () => {

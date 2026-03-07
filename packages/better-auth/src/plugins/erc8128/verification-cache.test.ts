@@ -6,11 +6,8 @@ import type {
 import { createVerificationCacheOps } from "./verification-cache";
 
 const val = (overrides?: Partial<CacheValue>): CacheValue => ({
-	address: "0xdead",
-	chainId: 1,
-	keyId: "erc8128:1:0xdead",
+	verified: true,
 	expires: Math.floor(Date.now() / 1000) + 300,
-	created: Math.floor(Date.now() / 1000),
 	...overrides,
 });
 
@@ -112,7 +109,7 @@ describe("secondaryStorage cache ops", () => {
 		expect(await ops.get("sig1")).toBeNull();
 	});
 
-	it("evictByKeyId and sweep are no-ops", () => {
+	it("sweep is a no-op for TTL-backed storage", () => {
 		const { storage } = createMockStorage();
 		const ops = createVerificationCacheOps(
 			"secondary-storage",
@@ -123,7 +120,6 @@ describe("secondaryStorage cache ops", () => {
 		);
 
 		// Should not throw
-		ops.evictByKeyId("key", 1000);
 		ops.sweep();
 	});
 
@@ -228,28 +224,6 @@ describe("database cache ops", () => {
 
 		expect(fallbackMap.has("sig1")).toBe(false);
 		expect(rows.has("erc8128:cache:sig1")).toBe(false);
-	});
-
-	it("evicts by keyId with notBefore", async () => {
-		const fallbackMap = new Map<string, CacheValue>();
-		const ops = createVerificationCacheOps(
-			"database",
-			undefined,
-			createMockAdapter().adapter,
-			fallbackMap,
-			100,
-		);
-
-		const now = Math.floor(Date.now() / 1000);
-		await ops.set("sig-old", val({ created: now - 100, keyId: "key1" }), 300);
-		await ops.set("sig-new", val({ created: now + 100, keyId: "key1" }), 300);
-		await ops.set("sig-other", val({ created: now - 100, keyId: "key2" }), 300);
-
-		ops.evictByKeyId("key1", now);
-
-		expect(fallbackMap.has("sig-old")).toBe(false);
-		expect(fallbackMap.has("sig-new")).toBe(true);
-		expect(fallbackMap.has("sig-other")).toBe(true);
 	});
 
 	it("enforces LRU eviction at max capacity", async () => {

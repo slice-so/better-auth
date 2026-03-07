@@ -1,4 +1,8 @@
-import type { VerifyPolicy, VerifyResult } from "@slicekit/erc8128";
+import type {
+	VerifyMessageFn,
+	VerifyPolicy,
+	VerifyResult,
+} from "@slicekit/erc8128";
 import { createVerifierClient, formatKeyId } from "@slicekit/erc8128";
 import { describe, expect, it, vi } from "vitest";
 import { getTestInstance } from "../../test-utils/test-instance";
@@ -89,6 +93,25 @@ async function post(
 				...(init?.headers ?? {}),
 			},
 			body: JSON.stringify(init?.body ?? {}),
+		}),
+	);
+	const data = await response.json();
+	return { response, data };
+}
+
+async function postRaw(
+	auth: TestAuth,
+	path: string,
+	init: { headers?: HeadersInit; body: string },
+) {
+	const response = await auth.handler(
+		new Request(`http://localhost:3000/api/auth${path}`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				...(init.headers ?? {}),
+			},
+			body: init.body,
 		}),
 	);
 	const data = await response.json();
@@ -228,6 +251,25 @@ describe("erc8128 plugin", () => {
 			expect(sessions.length).toBeGreaterThan(0);
 		});
 
+		it("verifies /erc8128/verify against the original request body bytes", async () => {
+			let seenBody = "";
+			mockVerifier(async ({ request }) => {
+				seenBody = await request.text();
+				return okResult();
+			});
+			const { auth } = await getTestInstance({
+				plugins: [erc8128({ verifyMessage: async () => true })],
+			});
+
+			const rawBody = '{  "email" : "alice@example.com"  }';
+			const { response } = await postRaw(auth, "/erc8128/verify", {
+				body: rawBody,
+			});
+
+			expect(response.status).toBe(200);
+			expect(seenBody).toBe(rawBody);
+		});
+
 		it("reuses existing user for same address+chain and does not duplicate user", async () => {
 			mockVerifier(async () => okResult());
 			const { auth } = await getTestInstance({
@@ -359,7 +401,7 @@ describe("erc8128 plugin", () => {
 	});
 
 	describe("hooks.before", () => {
-		it("middleware verifies signature and upserts user but does not create a session", async () => {
+		it("middleware verifies signature, authenticates the request, and does not set a session cookie", async () => {
 			mockVerifier(async () => okResult());
 			const { auth } = await getTestInstance({
 				plugins: [erc8128({ verifyMessage: async () => true })],
@@ -374,8 +416,10 @@ describe("erc8128 plugin", () => {
 				},
 			});
 			expect(response.status).toBe(200);
-			// Middleware does not create sessions — only /verify does
-			expect(data === null || data.session === null).toBe(true);
+			expect(data.session).toBeDefined();
+			expect(data.session.token).toContain("erc8128:");
+			expect(data.user).toBeDefined();
+			expect(response.headers.get("set-cookie")).toBeNull();
 
 			// But user + wallet were created
 			const wallets = await ctx.adapter.findMany<WalletAddress>({
@@ -401,7 +445,8 @@ describe("erc8128 plugin", () => {
 			expect(usersBefore).toHaveLength(1); // default test user
 			expect(walletsBefore).toHaveLength(0);
 
-			// Signed request to middleware — should auto-create user + wallet (no session)
+			// Signed request to middleware — should auto-create user + wallet and
+			// expose a request-scoped authenticated identity.
 			const { data, response } = await get(auth, "/get-session", {
 				headers: {
 					signature: "sig-first",
@@ -409,8 +454,10 @@ describe("erc8128 plugin", () => {
 				},
 			});
 			expect(response.status).toBe(200);
-			// Middleware never creates sessions
-			expect(data === null || data.session === null).toBe(true);
+			expect(data.session).toBeDefined();
+			expect(data.session.token).toContain("erc8128:");
+			expect(data.user).toBeDefined();
+			expect(response.headers.get("set-cookie")).toBeNull();
 
 			const usersAfter = await ctx.adapter.findMany({ model: "user" });
 			const walletsAfter = await ctx.adapter.findMany<WalletAddress>({
@@ -701,6 +748,7 @@ describe("erc8128 plugin", () => {
 			const cookie = cookieFromSetCookie(
 				verified.response.headers.get("set-cookie"),
 			);
+			const cookieSessionToken = verified.data.token as string;
 
 			const verifySpy = vi.fn(async () => okResult());
 			vi.mocked(createVerifierClient).mockImplementation(() => ({
@@ -708,7 +756,7 @@ describe("erc8128 plugin", () => {
 			}));
 
 			// Request with both cookie and signature headers — should still verify
-			const { response } = await get(auth, "/get-session", {
+			const { response, data } = await get(auth, "/get-session", {
 				headers: {
 					signature: "sig-verified",
 					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
@@ -717,6 +765,8 @@ describe("erc8128 plugin", () => {
 			});
 			expect(response.status).toBe(200);
 			expect(verifySpy).toHaveBeenCalled();
+			expect(data.session.token).toContain("erc8128:");
+			expect(data.session.token).not.toBe(cookieSessionToken);
 		});
 
 		it("reject-on-mismatch: passes when session and signature resolve to the same user", async () => {
@@ -865,6 +915,30 @@ describe("erc8128 plugin", () => {
 			expect(invalidation?.notBefore).toBe(notBefore);
 		});
 
+		it("verifies /erc8128/invalidate against the original request body bytes", async () => {
+			let seenBody = "";
+			mockVerifier(async ({ request }) => {
+				seenBody = await request.text();
+				return okResult({ replayable: false });
+			});
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: { default: { replayable: true } },
+					}),
+				],
+			});
+
+			const rawBody = '{  "signature" : "0xdeadbeef"  }';
+			const { response } = await postRaw(auth, "/erc8128/invalidate", {
+				body: rawBody,
+			});
+
+			expect(response.status).toBe(200);
+			expect(seenBody).toBe(rawBody);
+		});
+
 		it("replayable request to invalidation endpoint returns structured 401 with Accept-Signature", async () => {
 			mockVerifier(async ({ setHeaders }) => {
 				setHeaders?.(
@@ -948,19 +1022,45 @@ describe("erc8128 plugin", () => {
 			expect(response.status).not.toBe(200);
 		});
 
-		it("per-signature invalidation is checked via parallel DB query in middleware", async () => {
+		it("per-signature invalidation is enforced through verifier policy on later requests", async () => {
 			const keyId = formatKeyId(defaultChainId, defaultAddress);
 			const sig = "0xdeadbeefcafe";
 
-			mockVerifier(async ({ request }) => {
-				if (request.url.endsWith("/verify")) {
-					return okResult({ keyId, replayable: false });
-				}
-				if (request.url.endsWith("/invalidate")) {
-					return okResult({ keyId, replayable: false });
-				}
-				return okResult({ keyId, replayable: true });
-			});
+			vi.mocked(createVerifierClient).mockImplementation(
+				(args: {
+					defaults?: {
+						replayableInvalidated?: (value: {
+							keyid: string;
+							created: number;
+							expires: number;
+							label: string;
+							signature: `0x${string}`;
+							signatureBase: Uint8Array;
+							signatureParamsValue: string;
+						}) => Promise<boolean> | boolean;
+					};
+				}) => ({
+					verifyRequest: vi.fn(async ({ request }) => {
+						if (request.url.endsWith("/invalidate")) {
+							return okResult({ keyId, replayable: false });
+						}
+
+						const invalidated = await args.defaults?.replayableInvalidated?.({
+							keyid: keyId,
+							created: Math.floor(Date.now() / 1000),
+							expires: Math.floor(Date.now() / 1000) + 300,
+							label: "eth",
+							signature: sig,
+							signatureBase: new Uint8Array(),
+							signatureParamsValue: "sig",
+						});
+
+						return invalidated
+							? failResult("replayable_invalidated")
+							: okResult({ keyId, replayable: true });
+					}),
+				}),
+			);
 
 			const { auth } = await getTestInstance({
 				plugins: [
@@ -993,6 +1093,153 @@ describe("erc8128 plugin", () => {
 				error: "erc8128_verification_failed",
 				reason: "signature_invalidated",
 			});
+		});
+
+		it("prefetches replayable invalidation lookups before verifier hooks consume them", async () => {
+			const keyId = formatKeyId(defaultChainId, defaultAddress);
+			const sig = "0xdeadbeefcafe" as const;
+			const storageGet = vi.fn(async () => null);
+
+			vi.mocked(createVerifierClient).mockImplementation((args) => {
+				const defaults = args.defaults as {
+					replayableNotBefore?: (
+						keyid: string,
+					) => number | Promise<number | null> | null;
+					replayableInvalidated?: (value: {
+						keyid: string;
+						created: number;
+						expires: number;
+						label: string;
+						signature: `0x${string}`;
+						signatureBase: Uint8Array;
+						signatureParamsValue: string;
+					}) => Promise<boolean> | boolean;
+				};
+
+				return {
+					verifyRequest: vi.fn(async () => {
+						expect(storageGet).toHaveBeenCalledWith(
+							`erc8128:inv:keyid:${keyId.toLowerCase()}`,
+						);
+						expect(storageGet).toHaveBeenCalledWith(`erc8128:inv:sig:${sig}`);
+
+						const [notBefore, invalidated] = await Promise.all([
+							defaults.replayableNotBefore?.(keyId),
+							defaults.replayableInvalidated?.({
+								keyid: keyId,
+								created: Math.floor(Date.now() / 1000),
+								expires: Math.floor(Date.now() / 1000) + 300,
+								label: "eth",
+								signature: sig,
+								signatureBase: new Uint8Array(),
+								signatureParamsValue: "sig",
+							}),
+						]);
+
+						expect(notBefore).toBeNull();
+						expect(invalidated).toBe(false);
+						return okResult({ keyId, replayable: true });
+					}),
+				};
+			});
+
+			const { auth } = await getTestInstance({
+				secondaryStorage: {
+					get: storageGet,
+					set: vi.fn(),
+					delete: vi.fn(),
+				},
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: { default: { replayable: true } },
+					}),
+				],
+			});
+
+			const { response } = await get(auth, "/get-session", {
+				headers: {
+					signature: sig,
+					"signature-input": `sig=("@method" "@target-uri" "@authority");keyid="${keyId}"`,
+				},
+			});
+
+			expect(response.status).toBe(200);
+			const invalidationGets = (storageGet.mock.calls as unknown[][])
+				.map((call) => call[0])
+				.filter((key) => String(key).startsWith("erc8128:inv:"));
+			expect(invalidationGets).toEqual([
+				`erc8128:inv:keyid:${keyId.toLowerCase()}`,
+				`erc8128:inv:sig:${sig}`,
+			]);
+		});
+
+		it("falls back to the verifier keyid when the signature-input hint does not match", async () => {
+			const hintedKeyId = formatKeyId(defaultChainId, defaultAddress);
+			const actualAddress =
+				"0x000000000000000000000000000000000000beef" as const;
+			const actualKeyId = formatKeyId(defaultChainId, actualAddress);
+			const sig = "0xdeadbeefcafe" as const;
+			const storageGet = vi.fn(async () => null);
+
+			vi.mocked(createVerifierClient).mockImplementation((args) => {
+				const defaults = args.defaults as {
+					replayableNotBefore?: (
+						keyid: string,
+					) => number | Promise<number | null> | null;
+				};
+
+				return {
+					verifyRequest: vi.fn(async () => {
+						expect(storageGet).toHaveBeenCalledWith(
+							`erc8128:inv:keyid:${hintedKeyId.toLowerCase()}`,
+						);
+
+						const notBefore = await defaults.replayableNotBefore?.(actualKeyId);
+						expect(notBefore).toBeNull();
+						expect(storageGet).toHaveBeenCalledWith(
+							`erc8128:inv:keyid:${actualKeyId.toLowerCase()}`,
+						);
+
+						return okResult({
+							address: actualAddress,
+							keyId: actualKeyId,
+							replayable: true,
+						});
+					}),
+				};
+			});
+
+			const { auth } = await getTestInstance({
+				secondaryStorage: {
+					get: storageGet,
+					set: vi.fn(),
+					delete: vi.fn(),
+				},
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: { default: { replayable: true } },
+					}),
+				],
+			});
+
+			const { response } = await get(auth, "/get-session", {
+				headers: {
+					signature: sig,
+					"signature-input": `sig=("@method" "@target-uri" "@authority");keyid="${hintedKeyId}"`,
+				},
+			});
+
+			expect(response.status).toBe(200);
+			const invalidationGets = (storageGet.mock.calls as unknown[][])
+				.map((call) => call[0])
+				.filter((key) => String(key).startsWith("erc8128:inv:"));
+			expect(invalidationGets).toEqual([
+				`erc8128:inv:keyid:${hintedKeyId.toLowerCase()}`,
+				`erc8128:inv:sig:${sig}`,
+				`erc8128:inv:keyid:${actualKeyId.toLowerCase()}`,
+			]);
 		});
 
 		it("per-signature invalidation only affects the caller's own signatures", async () => {
@@ -1165,15 +1412,48 @@ describe("erc8128 plugin", () => {
 	});
 
 	describe("replayable signature caching", () => {
-		it("accepts same replayable signature multiple times within window", async () => {
-			const verifySpy = vi.fn(async () => okResult({ replayable: true }));
-			vi.mocked(createVerifierClient).mockImplementation(() => ({
-				verifyRequest: verifySpy,
-			}));
+		it("runs full verification on every request while caching verifyMessage results", async () => {
+			const verifyMessageSpy = vi.fn<
+				(args: {
+					address: `0x${string}`;
+					message: { raw: `0x${string}` };
+					signature: `0x${string}`;
+				}) => Promise<boolean>
+			>(async () => true);
+			const verifyRequestSpy = vi.fn(
+				async ({
+					request,
+					verifyMessage,
+				}: {
+					request: Request;
+					verifyMessage: (args: {
+						address: `0x${string}`;
+						message: { raw: `0x${string}` };
+						signature: `0x${string}`;
+					}) => boolean | Promise<boolean>;
+				}) => {
+					await verifyMessage({
+						address: defaultAddress,
+						message: { raw: "0x1234" },
+						signature: "0xdeadbeef",
+					});
+					return okResult({ replayable: true });
+				},
+			);
+			vi.mocked(createVerifierClient).mockImplementation(
+				(args: { verifyMessage: VerifyMessageFn }) => ({
+					verifyRequest: vi.fn(async ({ request }) =>
+						verifyRequestSpy({
+							request,
+							verifyMessage: args.verifyMessage,
+						}),
+					),
+				}),
+			);
 			const { auth } = await getTestInstance({
 				plugins: [
 					erc8128({
-						verifyMessage: async () => true,
+						verifyMessage: verifyMessageSpy,
 						routePolicy: { default: { replayable: true } },
 					}),
 				],
@@ -1188,7 +1468,55 @@ describe("erc8128 plugin", () => {
 
 			expect(first.response.status).toBe(200);
 			expect(second.response.status).toBe(200);
-			expect(verifySpy).toHaveBeenCalledTimes(1); // only first request triggers full verification; second uses cache
+			expect(verifyRequestSpy).toHaveBeenCalledTimes(2);
+			expect(verifyMessageSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("cache key includes the signature base, so different requests still re-check crypto", async () => {
+			const verifyMessageSpy = vi.fn<
+				(args: {
+					address: `0x${string}`;
+					message: { raw: `0x${string}` };
+					signature: `0x${string}`;
+				}) => Promise<boolean>
+			>(async () => true);
+			vi.mocked(createVerifierClient).mockImplementation(
+				(args: { verifyMessage: VerifyMessageFn }) => ({
+					verifyRequest: vi.fn(async ({ request }) => {
+						await args.verifyMessage({
+							address: defaultAddress,
+							message: {
+								raw: request.url.includes("page=2") ? "0x2222" : "0x1111",
+							},
+							signature: "0xdeadbeef",
+						});
+						return okResult({ replayable: true });
+					}),
+				}),
+			);
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: verifyMessageSpy,
+						routePolicy: { default: { replayable: true } },
+					}),
+				],
+			});
+
+			await get(auth, "/get-session?page=1", {
+				headers: {
+					signature: "sig-replayable",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+				},
+			});
+			await get(auth, "/get-session?page=2", {
+				headers: {
+					signature: "sig-replayable",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+				},
+			});
+
+			expect(verifyMessageSpy).toHaveBeenCalledTimes(2);
 		});
 
 		it("lazily sweeps expired cache entries on cache access", async () => {
@@ -1219,13 +1547,19 @@ describe("erc8128 plugin", () => {
 				});
 
 				await get(auth, "/get-session", {
-					headers: { signature: "sig-a", "signature-input": 'sig=("@method" "@target-uri" "@authority")' },
+					headers: {
+						signature: "sig-a",
+						"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+					},
 				});
 
 				vi.advanceTimersByTime(61_000);
 
 				await get(auth, "/get-session", {
-					headers: { signature: "sig-a", "signature-input": 'sig=("@method" "@target-uri" "@authority")' },
+					headers: {
+						signature: "sig-a",
+						"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+					},
 				});
 
 				const sigAVerifications = verifySpy.mock.calls.filter(

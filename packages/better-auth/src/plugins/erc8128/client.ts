@@ -28,6 +28,8 @@ export interface CachedSignature {
 	signature: string;
 	signatureInput: string;
 	expires: number;
+	binding?: "request-bound" | "class-bound";
+	requestKey?: string;
 	/** Derived-component identifiers covered by this signature. */
 	components: string[];
 }
@@ -37,9 +39,10 @@ export interface CachedSignature {
  * Implement this for backend/Node.js environments that don't have
  * `localStorage` (e.g. Redis, database, in-memory Map).
  *
- * Each keyId maps to an **array** of cached signatures — different routes
- * may require different class-bound components, so multiple valid entries
- * can coexist until they expire.
+ * Each keyId maps to an **array** of cached signatures. Replayable
+ * request-bound signatures are reused only for the exact same request
+ * fingerprint, while class-bound signatures can satisfy multiple routes
+ * when their covered components are sufficient.
  */
 export interface Erc8128SignatureStore {
 	/** Retrieve all cached signatures for a keyId, or `null` if none. */
@@ -114,6 +117,71 @@ function parseComponentsFromSignatureInput(signatureInput: string): string[] {
 	return [...inner.matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
 }
 
+function isBodyInit(body: unknown): body is BodyInit {
+	return (
+		typeof body === "string" ||
+		body instanceof URLSearchParams ||
+		(typeof FormData !== "undefined" && body instanceof FormData) ||
+		(typeof Blob !== "undefined" && body instanceof Blob) ||
+		body instanceof ArrayBuffer ||
+		ArrayBuffer.isView(body) ||
+		(typeof ReadableStream !== "undefined" && body instanceof ReadableStream)
+	);
+}
+
+function resolveRequestBody(body: unknown): BodyInit | null | undefined {
+	if (body === undefined || body === null) {
+		return body;
+	}
+	if (isBodyInit(body)) {
+		return body;
+	}
+	if (typeof body === "object") {
+		return JSON.stringify(body);
+	}
+	return String(body);
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+	return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+		"",
+	);
+}
+
+async function createRequestFingerprint(request: Request): Promise<string> {
+	const headerEntries = Array.from(request.headers.entries())
+		.filter(
+			([name]) =>
+				name.toLowerCase() !== "signature" &&
+				name.toLowerCase() !== "signature-input",
+		)
+		.sort(([left], [right]) => left.localeCompare(right));
+
+	const bodyBytes =
+		request.method === "GET" || request.method === "HEAD"
+			? ""
+			: bytesToHex(new Uint8Array(await request.clone().arrayBuffer()));
+
+	return JSON.stringify({
+		method: request.method,
+		url: request.url,
+		headers: headerEntries,
+		body: bodyBytes,
+	});
+}
+
+function matchesCachedSignature(
+	entry: CachedSignature,
+	routePolicy: RoutePolicy | undefined,
+	requestKey: string,
+): boolean {
+	if (entry.binding === "request-bound") {
+		return entry.requestKey === requestKey;
+	}
+
+	return matchesClassBoundPolicy(entry.components, routePolicy);
+}
+
 /**
  * Check whether a cached signature's components satisfy at least one of
  * the route's classBoundPolicies. Returns `true` when no policy is set.
@@ -140,6 +208,10 @@ function buildFullUrl(base: string, path: string): string {
 	const p = path.startsWith("/") ? path : `/${path}`;
 	return `${b}${p}`;
 }
+
+type RequestInitWithDuplex = RequestInit & {
+	duplex?: "half" | "full";
+};
 
 function createLocalStorageAdapter(prefix: string): Erc8128SignatureStore {
 	return {
@@ -292,6 +364,13 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 					).toUpperCase();
 					const client = getClient(signer);
 					const keyId = getKeyId(signer);
+					const requestInit: RequestInitWithDuplex = {
+						method,
+						headers: (fetchOptions?.headers as HeadersInit) || {},
+						body: resolveRequestBody(fetchOptions?.body),
+						duplex: fetchOptions?.duplex,
+					};
+					const tempReq = new Request(fullUrl, requestInit);
 
 					// Apply server config to the client so it can resolve posture
 					if (serverConfig) {
@@ -307,6 +386,9 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 						{ ...forwardedSignOptions, replay },
 					);
 					const useCache = posture.replay === "replayable";
+					const requestKey = useCache
+						? await createRequestFingerprint(tempReq)
+						: "";
 
 					// Resolve route policy for cache matching (supports
 					// list-of-lists classBoundPolicies alternatives)
@@ -319,7 +401,8 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 								)
 							: undefined;
 
-					// Try cache for class-bound replayable routes
+					// Try cache for replayable routes. Request-bound entries are
+					// reusable only for the same request fingerprint.
 					const now = Math.floor(Date.now() / 1000);
 					let validEntries: CachedSignature[] | null = null;
 
@@ -338,9 +421,9 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 								}
 							}
 
-							// Find an entry whose components satisfy the route
+							// Find a reusable entry for this request.
 							const match = validEntries?.find((e) =>
-								matchesClassBoundPolicy(e.components, routePolicy),
+								matchesCachedSignature(e, routePolicy, requestKey),
 							);
 							if (match) {
 								const headers = new Headers(
@@ -352,12 +435,6 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 							}
 						}
 					}
-
-					// Sign — the client resolves posture internally
-					const tempReq = new Request(fullUrl, {
-						method,
-						headers: (fetchOptions?.headers as HeadersInit) || {},
-					});
 
 					const signedReq = await client.signRequest(tempReq);
 
@@ -371,7 +448,8 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 					headers.set("signature", sig);
 					headers.set("signature-input", sigInput);
 
-					// Cache class-bound replayable signatures
+					// Cache replayable signatures. Request-bound entries carry an
+					// exact request fingerprint so they are only reused when safe.
 					if (useCache && store) {
 						const expires = parseExpiresFromSignatureInput(sigInput);
 						if (expires) {
@@ -379,6 +457,9 @@ export const erc8128Client = (options?: Erc8128ClientOptions) => {
 								signature: sig,
 								signatureInput: sigInput,
 								expires,
+								binding: posture.binding,
+								requestKey:
+									posture.binding === "request-bound" ? requestKey : undefined,
 								components: parseComponentsFromSignatureInput(sigInput),
 							};
 							const updated = [...(validEntries ?? []), entry];

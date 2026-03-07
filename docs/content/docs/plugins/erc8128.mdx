@@ -114,7 +114,7 @@ A signed `POST` to `/erc8128/verify` verifies the signature, creates a user (if 
 
 **Per-request** authentication verifies a signature on every call with no sessions involved — suited for backend services, AI agents, and stateless APIs.
 
-When any request to `auth.handler` carries ERC-8128 signature headers (`Signature` + `Signature-Input` or `Authorization: ERC-8128 ...`) and no valid session cookie is present, the middleware verifies it automatically before the endpoint runs. If the wallet is new, the middleware creates the user and wallet record — no prior call to `/erc8128/verify` is needed. The middleware does not create sessions — each request is authenticated individually by its signature.
+When any request to `auth.handler` carries ERC-8128 signature headers (`Signature` + `Signature-Input`) and no valid session cookie is present, the middleware verifies it automatically before the endpoint runs. If the wallet is new, the middleware creates the user and wallet record — no prior call to `/erc8128/verify` is needed. The middleware does not mint or persist a cookie session, but it does populate a request-scoped authenticated identity so Better Auth routes can treat the signer as the current user for that request.
 
 <Callout>
   The middleware only runs for requests routed through `auth.handler`. For custom routes outside Better Auth, use `verifyRequest()` from `@slicekit/erc8128` directly.
@@ -166,7 +166,7 @@ By default, the client signs every request with a nonce — making each signatur
 When any route policy allows replayable signatures, the plugin automatically enables:
 
 - The `/erc8128/invalidate` endpoint for revoking signatures.
-- Server-side verification caching so repeated use of the same signature skips re-verification.
+- Server-side cryptographic verification caching so repeated replayable requests can skip repeated `ecrecover` / ERC-1271 checks while still running full request verification.
 
 ### Invalidation
 
@@ -213,7 +213,7 @@ erc8128Client({
 
 ### Signature Caching
 
-When a signature is both class-bound and replayable, the client caches it and reuses it across requests — avoiding a cryptographic signing operation on every call.
+When a signature is replayable, the client caches it and reuses it when safe — avoiding a cryptographic signing operation on every call. Class-bound signatures can satisfy multiple requests when their covered components match the route policy. Request-bound signatures are reused only for the exact same request shape.
 
 Caching is controlled by the `storage` option: `"localStorage"` uses the browser adapter (default when available), an `Erc8128SignatureStore` object provides a custom async-capable store for Node.js backends (Redis, database, in-memory Map), and `false` disables caching entirely.
 
@@ -232,7 +232,7 @@ erc8128Client({
 })
 ```
 
-Each keyId maps to an array of cached signatures — different routes may require different class-bound components, so multiple valid entries coexist until they expire. Expired entries are pruned automatically on each cache access. The `clearSignatureCache()` action removes all entries for the current signer.
+Each keyId maps to an array of cached signatures — different routes may require different class-bound components, and request-bound signatures may exist for distinct exact-request fingerprints. Expired entries are pruned automatically on each cache access. The `clearSignatureCache()` action removes all entries for the current signer.
 
 ## Error Handling
 
@@ -256,7 +256,7 @@ The plugin manages three types of ephemeral data — all with bounded lifetimes 
 | --- | --- | --- |
 | **Nonce tracking** | Prevent replay of non-replayable signatures | Security-critical |
 | **Signature invalidation** | Revoke replayable signatures | Security-critical |
-| **Verification cache** | Skip re-verification for known-good replayable signatures | Performance only |
+| **Verification cache** | Cache successful cryptographic signature checks for replayable traffic while still running full request verification | Performance only |
 
 ### Secondary Storage
 
@@ -291,7 +291,6 @@ For production deployments with multiple server instances, configure `secondaryS
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `verifyMessage` | `VerifyMessageFn` | *required* | Signature verification function (use viem's `publicClient.verifyMessage` — handles both EOA and ERC-1271 smart contract signatures). |
-| `defaultPolicy` | `VerifyPolicy` | — | Default verification policy for middleware. |
 | `routePolicy` | `Record<string, VerifyPolicy \| false>` | — | Per-route middleware policy map — see [Route Policy](#route-policy). |
 | `sessionExpiresIn` | `number` | — | Session TTL in seconds (for `/erc8128/verify`). |
 | `maxValiditySec` | `number` | `300` | Maximum signature validity window (seconds). |
@@ -300,7 +299,7 @@ For production deployments with multiple server instances, configure `secondaryS
 | `storeInDatabase` | `boolean` | `false` | When `secondaryStorage` is configured, also persist nonces and invalidation to the database. See [Storage](#storage). |
 | `cacheSize` | `number` | `10000` | Max entries in the in-memory verification cache. Ignored when `secondaryStorage` is active. |
 | `emailDomainName` | `string` | From `baseURL` | Domain for auto-generated user emails. |
-| `anonymous` | `boolean` | `true` | If `false`, email is required on verify. |
+| `anonymous` | `boolean` | `true` | If `false`, email is required on `/erc8128/verify`. Per-request auth can only authenticate already-linked wallets unless anonymous onboarding is enabled. |
 | `ensLookup` | `Function` | — | ENS resolver for new user name/avatar. |
 
 ### Client

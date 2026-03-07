@@ -6,6 +6,7 @@ import {
 	createAuthEndpoint,
 	createAuthMiddleware,
 } from "@better-auth/core/api";
+import type { Session } from "@better-auth/core/db";
 import type {
 	VerifyMessageFn,
 	VerifyPolicy,
@@ -131,6 +132,11 @@ const invalidateBodySchema = z
 	.refine((data) => !data || !(data.notBefore && data.signature), {
 		message: "Provide either notBefore or signature, not both",
 	});
+
+function extractKeyIdFromSignatureInput(signatureInput: string): string | null {
+	const match = signatureInput.match(/(?:^|;)\s*keyid="([^"]+)"/i);
+	return match?.[1] ?? null;
+}
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
 	const replayableEnabled =
@@ -259,6 +265,70 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			}
 		}
 		return nonceStoreInstance;
+	};
+
+	const createEphemeralSignatureSession = (
+		user: User,
+		result: Extract<VerifyResult, { ok: true }>,
+		request?: Request,
+	): {
+		session: Session;
+		user: User;
+	} => {
+		const keyId = result.params.keyid.toLowerCase();
+		const createdAt = new Date(result.params.created * 1000);
+		const expiresAt = new Date(result.params.expires * 1000);
+		const token = `erc8128:${keyId}:${result.params.created}:${result.params.expires}`;
+
+		return {
+			user,
+			session: {
+				id: token,
+				userId: user.id,
+				token,
+				expiresAt,
+				createdAt,
+				updatedAt: createdAt,
+				ipAddress: null,
+				userAgent: request?.headers.get("user-agent") ?? null,
+			},
+		};
+	};
+
+	const createCachedVerifyMessage = (
+		ctx: GenericEndpointContext,
+	): VerifyMessageFn => {
+		if (!replayableEnabled || storageMode === "none") {
+			return options.verifyMessage;
+		}
+
+		const cache = getCache(ctx);
+		const ttlSec = Math.max(
+			options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC,
+			1,
+		);
+
+		return async (args) => {
+			cache.sweep();
+			const cacheKey = `${args.address.toLowerCase()}:${args.signature}:${args.message.raw}`;
+			const cached = await cache.get(cacheKey);
+			if (cached) {
+				return true;
+			}
+
+			const verified = await options.verifyMessage(args);
+			if (verified) {
+				await cache.set(
+					cacheKey,
+					{
+						verified: true,
+						expires: Math.floor(Date.now() / 1000) + ttlSec,
+					},
+					ttlSec,
+				);
+			}
+			return verified;
+		};
 	};
 
 	const findOrCreateWalletUser = async (
@@ -468,9 +538,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							}
 						}
 
-						const hasSignatureHeaders =
-							!!incomingHeaders.get("signature") &&
-							!!incomingHeaders.get("signature-input");
+						const signature = incomingHeaders.get("signature");
+						const signatureInput = incomingHeaders.get("signature-input");
+						const hasSignatureHeaders = !!signature && !!signatureInput;
 
 						if (!hasSignatureHeaders) {
 							if (!resolvedRoutePolicy.requireAuth) {
@@ -493,8 +563,48 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							);
 						}
 
+						const invalidationOps =
+							replayableEnabled && storageMode !== "none"
+								? getInvalidationOps(ctx)
+								: null;
+						const hintedKeyId = signatureInput
+							? (extractKeyIdFromSignatureInput(
+									signatureInput,
+								)?.toLowerCase() ?? null)
+							: null;
+						const prefetchedKeyIdInvalidations =
+							invalidationOps && hintedKeyId
+								? invalidationOps.findByKeyId(hintedKeyId)
+								: null;
+						const prefetchedSignatureInvalidation =
+							invalidationOps && signature
+								? invalidationOps.findBySignature(signature)
+								: null;
+
+						const getKeyIdInvalidations = (keyid: string) => {
+							const normalizedKeyId = keyid.toLowerCase();
+							if (
+								prefetchedKeyIdInvalidations &&
+								hintedKeyId === normalizedKeyId
+							) {
+								return prefetchedKeyIdInvalidations;
+							}
+							return invalidationOps
+								? invalidationOps.findByKeyId(normalizedKeyId)
+								: Promise.resolve([]);
+						};
+
+						const getSignatureInvalidation = (value: string) => {
+							if (prefetchedSignatureInvalidation && value === signature) {
+								return prefetchedSignatureInvalidation;
+							}
+							return invalidationOps
+								? invalidationOps.findBySignature(value)
+								: Promise.resolve(null);
+						};
+
 						const verifier = createVerifierClient({
-							verifyMessage: options.verifyMessage,
+							verifyMessage: createCachedVerifyMessage(ctx),
 							nonceStore: getNonceStore(ctx),
 							defaults: {
 								...options.routePolicy?.default,
@@ -505,69 +615,25 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								...(replayableEnabled
 									? {
 											replayableNotBefore: async (keyid: string) => {
-												const inv = getInvalidationOps(ctx);
-												const records = await inv.findByKeyId(keyid);
+												const records = await getKeyIdInvalidations(keyid);
 												const keyRecord = records.find((r) => !r.signature);
 												return keyRecord?.notBefore ?? null;
+											},
+											replayableInvalidated: async ({ keyid, signature }) => {
+												const record =
+													await getSignatureInvalidation(signature);
+												return !!(
+													record &&
+													(!record.keyId ||
+														record.keyId === keyid.toLowerCase())
+												);
 											},
 										}
 									: {}),
 							},
 						});
 
-						const signature =
-							ctx.request?.headers.get("signature") ||
-							ctx.headers?.get("signature") ||
-							null;
-
 						const responseHeaders: Record<string, string> = {};
-
-						// Check replayable signature cache before full verification
-						let result: VerifyResult | null = null;
-						const cache = getCache(ctx);
-						if (signature && replayableEnabled) {
-							cache.sweep();
-
-							const cached = await cache.get(signature);
-							if (cached && cached.expires > Math.floor(Date.now() / 1000)) {
-								// Single query returns both per-keyId notBefore and per-signature invalidation records
-								const inv = getInvalidationOps(ctx);
-								const [keyIdRecords, invalidatedRecord] = await Promise.all([
-									inv.findByKeyId(cached.keyId),
-									inv.findBySignature(signature),
-								]);
-								const notBeforeRecord = keyIdRecords.find((r) => !r.signature);
-
-								// Only treat as invalidated if the record's keyId matches the signature's keyId
-								// (prevents User A from invalidating User B's signatures)
-								const sigInvalidatedByCaller =
-									invalidatedRecord &&
-									(!invalidatedRecord.keyId ||
-										invalidatedRecord.keyId === cached.keyId.toLowerCase());
-
-								if (sigInvalidatedByCaller) {
-									await cache.delete(signature);
-								} else if (
-									!notBeforeRecord ||
-									cached.created > notBeforeRecord.notBefore
-								) {
-									result = {
-										ok: true,
-										address: cached.address as `0x${string}`,
-										chainId: cached.chainId,
-										label: "eth",
-										components: ["@method", "@target-uri", "@authority"],
-										params: {
-											created: cached.created,
-											expires: cached.expires,
-											keyid: cached.keyId.toLowerCase(),
-										},
-										replayable: true,
-										binding: "class-bound",
-									};
-								}
-							}
-						}
 
 						if (!ctx.request) {
 							if (!resolvedRoutePolicy.requireAuth) {
@@ -590,69 +656,30 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							);
 						}
 
-						if (!result) {
-							// Start invalidation check in parallel with verification
-							const inv = getInvalidationOps(ctx);
-							const invalidationPromise = signature
-								? inv.findBySignature(signature)
-								: Promise.resolve(null);
-
-							const verificationPromise = verifier.verifyRequest({
-								request: ctx.request,
-								policy: resolvedRoutePolicy.policy,
-								setHeaders: (name, value) => {
-									responseHeaders[name] = value;
-								},
-							});
-
-							// Await both in parallel — we need the keyId from verification
-							// to confirm the invalidation record belongs to the same signer
-							const [invalidatedRecord, verifyResult] = await Promise.all([
-								invalidationPromise,
-								verificationPromise,
-							]);
-
-							const sigKeyId = verifyResult.ok
-								? verifyResult.params.keyid.toLowerCase()
-								: null;
-							const sigInvalidatedByCaller =
-								invalidatedRecord &&
-								sigKeyId &&
-								(!invalidatedRecord.keyId ||
-									invalidatedRecord.keyId === sigKeyId);
-
-							if (sigInvalidatedByCaller) {
-								await cache.delete(signature!);
-								if (!resolvedRoutePolicy.requireAuth) {
-									return;
-								}
-								return new Response(
-									JSON.stringify({
-										error: "erc8128_verification_failed",
-										reason: "signature_invalidated",
-										detail: "Signature has been explicitly invalidated",
-									}),
-									{
-										status: 401,
-										headers: {
-											"Content-Type": "application/json",
-											...responseHeaders,
-										},
-									},
-								);
-							}
-
-							result = verifyResult;
-						}
+						const result = await verifier.verifyRequest({
+							request: ctx.request,
+							policy: resolvedRoutePolicy.policy,
+							setHeaders: (name, value) => {
+								responseHeaders[name] = value;
+							},
+						});
 						if (!result.ok) {
 							if (!resolvedRoutePolicy.requireAuth) {
 								return;
 							}
+							const reason =
+								result.reason === "replayable_invalidated"
+									? "signature_invalidated"
+									: result.reason;
+							const detail =
+								result.reason === "replayable_invalidated"
+									? "Signature has been explicitly invalidated"
+									: result.detail;
 							return new Response(
 								JSON.stringify({
 									error: "erc8128_verification_failed",
-									reason: result.reason,
-									detail: result.detail,
+									reason,
+									detail,
 								}),
 								{
 									status: 401,
@@ -662,25 +689,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									},
 								},
 							);
-						}
-
-						// Cache replayable verification result
-						if (signature && result.replayable && replayableEnabled) {
-							const ttlSec =
-								result.params.expires - Math.floor(Date.now() / 1000);
-							if (ttlSec > 0) {
-								await cache.set(
-									signature,
-									{
-										address: result.address,
-										chainId: result.chainId,
-										keyId: result.params.keyid.toLowerCase(),
-										expires: result.params.expires,
-										created: result.params.created,
-									},
-									ttlSec,
-								);
-							}
 						}
 
 						const walletAddress = result.address;
@@ -714,6 +722,25 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									},
 								);
 							}
+							if (!currentSession && walletUser) {
+								ctx.context.session = createEphemeralSignatureSession(
+									walletUser,
+									result,
+									ctx.request,
+								);
+							}
+							return;
+						}
+
+						if (
+							walletUser &&
+							(precedence === "signature-first" || !hasSessionCookie)
+						) {
+							ctx.context.session = createEphemeralSignatureSession(
+								walletUser,
+								result,
+								ctx.request,
+							);
 						}
 					}),
 				},
@@ -756,6 +783,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					method: "POST",
 					body: verifyBodySchema,
 					requireRequest: true,
+					cloneRequest: true,
 				},
 				async (ctx) => {
 					await ensureStorageMode(ctx);
@@ -778,19 +806,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					const responseHeaders: Record<string, string> = {};
 
 					const sourceRequest = ctx.request!;
-					const hasBodyMethod =
-						sourceRequest.method !== "GET" && sourceRequest.method !== "HEAD";
-					const verificationRequest =
-						hasBodyMethod && ctx.body !== undefined
-							? new Request(sourceRequest.url, {
-									method: sourceRequest.method,
-									headers: sourceRequest.headers,
-									body: JSON.stringify(ctx.body),
-								})
-							: sourceRequest;
-
 					const result = await verifier.verifyRequest({
-						request: verificationRequest,
+						request: sourceRequest,
 						setHeaders: (name, value) => {
 							responseHeaders[name] = value;
 						},
@@ -876,6 +893,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								method: "POST",
 								body: invalidateBodySchema,
 								requireRequest: true,
+								cloneRequest: true,
 							},
 							async (ctx) => {
 								await ensureStorageMode(ctx);
@@ -897,27 +915,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								const responseHeaders: Record<string, string> = {};
 
 								const sourceRequest = ctx.request!;
-								const hasBodyMethod =
-									sourceRequest.method !== "GET" &&
-									sourceRequest.method !== "HEAD";
-								const verificationRequest = hasBodyMethod
-									? (() => {
-											const headers = new Headers(sourceRequest.headers);
-											headers.delete("content-length");
-											const body =
-												ctx.body === undefined
-													? undefined
-													: JSON.stringify(ctx.body);
-											return new Request(sourceRequest.url, {
-												method: sourceRequest.method,
-												headers,
-												body,
-											});
-										})()
-									: sourceRequest;
-
 								const result = await verifier.verifyRequest({
-									request: verificationRequest,
+									request: sourceRequest,
 									setHeaders: (name, value) => {
 										responseHeaders[name] = value;
 									},
@@ -951,9 +950,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 										maxValidity ?? DEFAULT_MAX_VALIDITY_SEC,
 									);
 
-									const sigCache = getCache(ctx);
-									await sigCache.delete(sigToInvalidate);
-
 									return ctx.json({
 										success: true,
 										invalidatedSignature: sigToInvalidate,
@@ -966,13 +962,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 								await invOps.upsertKeyIdNotBefore(
 									result.params.keyid,
-									notBefore,
-								);
-
-								// Evict cached entries that are now invalidated
-								const keyIdCache = getCache(ctx);
-								keyIdCache.evictByKeyId(
-									result.params.keyid.toLowerCase(),
 									notBefore,
 								);
 

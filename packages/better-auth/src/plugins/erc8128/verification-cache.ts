@@ -1,11 +1,8 @@
 import type { SecondaryStorage } from "@better-auth/core/db";
 
 export type CacheValue = {
-	address: string;
-	chainId: number;
-	keyId: string;
+	verified: true;
 	expires: number;
-	created: number;
 };
 
 export const DEFAULT_CACHE_SIZE = 10_000;
@@ -15,10 +12,10 @@ const CACHE_KEY_PREFIX = "erc8128:cache:";
 /**
  * Unified interface for the replayable signature verification cache.
  *
- * This cache stores the result of successful replayable signature verifications
- * so that subsequent requests carrying the same signature can skip the expensive
- * cryptographic re-verification. It is a pure performance optimization — a cache
- * miss simply triggers a full verification; there is no security impact.
+ * This cache stores successful `verifyMessage` outcomes so replayable signatures
+ * can skip repeated EOA recovery / ERC-1271 `isValidSignature` checks. Request
+ * verification still runs fully on every request; this cache only avoids the
+ * expensive cryptographic sub-step. It is a pure performance optimization.
  *
  * This is separate from (and should not be confused with):
  * - **Nonce store** — replay protection for non-replayable signatures; stored in
@@ -27,11 +24,9 @@ const CACHE_KEY_PREFIX = "erc8128:cache:";
  *   Security-critical (losing state would re-enable revoked signatures).
  */
 export interface VerificationCacheOps {
-	get(sig: string): Promise<CacheValue | null>;
-	set(sig: string, value: CacheValue, ttlSec: number): Promise<void>;
-	delete(sig: string): Promise<void>;
-	/** Evict entries matching keyId with created <= notBefore. No-op for external stores. */
-	evictByKeyId(keyId: string, notBefore: number): void;
+	get(key: string): Promise<CacheValue | null>;
+	set(key: string, value: CacheValue, ttlSec: number): Promise<void>;
+	delete(key: string): Promise<void>;
 	/** Sweep expired entries from the in-memory tier. No-op for TTL-based stores. */
 	sweep(): void;
 }
@@ -67,43 +62,41 @@ export function createVerificationCacheOps(
 	maxSize: number,
 ): VerificationCacheOps {
 	// --- Strategy: secondaryStorage (e.g. Redis) ---
-	// Entries are stored with a TTL matching the signature's remaining validity.
-	// evictByKeyId and sweep are no-ops: TTL handles expiry, and the per-request
-	// DB invalidation check catches revoked signatures before using cached results.
+	// Entries are stored with a TTL matching the signature validity window.
+	// sweep is a no-op because TTL handles expiry.
 	if (strategy === "secondary-storage" && secondaryStorage) {
 		return {
-			async get(sig) {
+			async get(key) {
 				try {
-					const raw = await secondaryStorage.get(CACHE_KEY_PREFIX + sig);
+					const raw = await secondaryStorage.get(CACHE_KEY_PREFIX + key);
 					if (!raw) return null;
 					return JSON.parse(raw as string) as CacheValue;
 				} catch {
 					return null;
 				}
 			},
-			async set(sig, value, ttlSec) {
+			async set(key, value, ttlSec) {
 				try {
 					await secondaryStorage.set(
-						CACHE_KEY_PREFIX + sig,
+						CACHE_KEY_PREFIX + key,
 						JSON.stringify(value),
 						ttlSec,
 					);
 				} catch {}
 			},
-			async delete(sig) {
+			async delete(key) {
 				try {
-					await secondaryStorage.delete(CACHE_KEY_PREFIX + sig);
+					await secondaryStorage.delete(CACHE_KEY_PREFIX + key);
 				} catch {}
 			},
-			evictByKeyId() {},
 			sweep() {},
 		};
 	}
 
 	// --- Shared: bounded in-memory Map helpers ---
-	const setInMemory = (sig: string, value: CacheValue) => {
-		if (fallbackMap.has(sig)) fallbackMap.delete(sig);
-		fallbackMap.set(sig, value);
+	const setInMemory = (key: string, value: CacheValue) => {
+		if (fallbackMap.has(key)) fallbackMap.delete(key);
+		fallbackMap.set(key, value);
 		// LRU eviction: drop oldest entry when over capacity
 		if (fallbackMap.size > maxSize) {
 			const oldest = fallbackMap.keys().next().value;
@@ -117,15 +110,9 @@ export function createVerificationCacheOps(
 		if (nowMs - lastSweepMs < CACHE_SWEEP_INTERVAL_MS) return;
 		lastSweepMs = nowMs;
 		const nowSec = Math.floor(nowMs / 1000);
-		for (const [sig, value] of fallbackMap) {
-			if (value.expires < nowSec) fallbackMap.delete(sig);
-		}
-	};
-
-	const evictByKeyIdInMemory = (keyId: string, notBefore: number) => {
-		for (const [sig, value] of fallbackMap) {
-			if (value.keyId.toLowerCase() === keyId && value.created <= notBefore) {
-				fallbackMap.delete(sig);
+		for (const [key, value] of fallbackMap) {
+			if (value.expires < nowSec) {
+				fallbackMap.delete(key);
 			}
 		}
 	};
@@ -135,41 +122,40 @@ export function createVerificationCacheOps(
 	// Writes persist to both in-memory and DB. DB entries expire via `expiresAt`.
 	// If DB operations fail, the in-memory Map acts as a graceful fallback.
 	return {
-		async get(sig) {
-			const inMemory = fallbackMap.get(sig);
+		async get(key) {
+			const inMemory = fallbackMap.get(key);
 			if (inMemory) return inMemory;
 			try {
 				const record = await adapter.findVerificationValue(
-					CACHE_KEY_PREFIX + sig,
+					CACHE_KEY_PREFIX + key,
 				);
 				if (!record) return null;
 				const parsed = JSON.parse(record.value) as CacheValue;
-				setInMemory(sig, parsed);
+				setInMemory(key, parsed);
 				return parsed;
 			} catch {
 				return null;
 			}
 		},
-		async set(sig, value, ttlSec) {
-			setInMemory(sig, value);
+		async set(key, value, ttlSec) {
+			setInMemory(key, value);
 			try {
 				try {
-					await adapter.deleteVerificationByIdentifier(CACHE_KEY_PREFIX + sig);
+					await adapter.deleteVerificationByIdentifier(CACHE_KEY_PREFIX + key);
 				} catch {}
 				await adapter.createVerificationValue({
-					identifier: CACHE_KEY_PREFIX + sig,
+					identifier: CACHE_KEY_PREFIX + key,
 					value: JSON.stringify(value),
 					expiresAt: new Date(Date.now() + ttlSec * 1000),
 				});
 			} catch {}
 		},
-		async delete(sig) {
-			fallbackMap.delete(sig);
+		async delete(key) {
+			fallbackMap.delete(key);
 			try {
-				await adapter.deleteVerificationByIdentifier(CACHE_KEY_PREFIX + sig);
+				await adapter.deleteVerificationByIdentifier(CACHE_KEY_PREFIX + key);
 			} catch {}
 		},
-		evictByKeyId: evictByKeyIdInMemory,
 		sweep: sweepInMemory,
 	};
 }
