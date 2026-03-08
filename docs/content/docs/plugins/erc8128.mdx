@@ -7,13 +7,71 @@ description: Authenticate requests with Ethereum accounts using HTTP Message Sig
 
 This plugin integrates ERC-8128 into Better Auth with two modes: **session-based authentication** (sign once via `/erc8128/verify`, get a session, use cookies normally) and **per-request authentication** where every call is individually signed.
 
-## Quick Start (Recommended)
+## Quick Start
 
-For production, use **secondaryStorage** (for example Redis) and keep `storeInDatabase: false` (default). This gives shared nonce tracking/invalidation/caching with the best runtime performance.
+```ts title="auth.ts"
+import { betterAuth } from "better-auth";
+import { erc8128 } from "better-auth/plugins";
+import { createPublicClient, http } from "viem";
+import { mainnet } from "viem/chains";
 
-If persistent audit/recovery in SQL is required, set `storeInDatabase: true` to dual-write nonce and invalidation records (higher write cost).
+const publicClient = createPublicClient({
+  chain: mainnet,
+  transport: http(),
+});
 
-If no persistent storage is available, the plugin falls back to **request-bound middleware verification only** for explicitly protected routes; persistence-dependent endpoints are disabled. If a protected route policy requires `replayable: true`, verification fails with `replayable_requires_storage` until DB or secondaryStorage is configured.
+export const auth = betterAuth({
+  plugins: [
+    erc8128({
+      verifyMessage: publicClient.verifyMessage,
+      authPrecedence: "signature-first",
+      routePolicy: {
+        "/feed": { methods: ["GET"], replayable: true },
+        "/verify": { methods: ["DELETE"], replayable: false },
+      },
+    }),
+  ],
+});
+```
+
+```ts title="auth-client.ts"
+import { createAuthClient } from "better-auth/client";
+import { erc8128Client } from "better-auth/client/plugins";
+import { createWalletClient, custom } from "viem";
+import { mainnet } from "viem/chains";
+
+const wallet = createWalletClient({
+  chain: mainnet,
+  transport: custom(window.ethereum!),
+});
+const [address] = await wallet.getAddresses();
+
+export const authClient = createAuthClient({
+  plugins: [
+    erc8128Client({
+      signer: {
+        address,
+        chainId: mainnet.id,
+        signMessage: (message) =>
+          wallet.signMessage({ account: address, message: { raw: message } }),
+      },
+    }),
+  ],
+});
+```
+
+```ts title="App route"
+const result = await auth.api.erc8128.protect(request);
+
+if (!result.ok) {
+  return result.response;
+}
+
+const user = result.principal?.user ?? null;
+const session = result.principal?.session ?? null;
+```
+
+If the request already goes through `auth.handler`, the plugin runs automatically. `authPrecedence: "signature-first"` makes ERC-8128 win when both a Better Auth session and signature headers are present.
 
 ## Installation
 
@@ -117,8 +175,28 @@ A signed `POST` to `/erc8128/verify` verifies the signature, creates a user (if 
 When any request to `auth.handler` carries ERC-8128 signature headers (`Signature` + `Signature-Input`) and no valid session cookie is present, the middleware verifies it automatically before the endpoint runs. If the wallet is new, the middleware creates the user and wallet record — no prior call to `/erc8128/verify` is needed. The middleware does not mint or persist a cookie session, but it does populate a request-scoped authenticated identity so Better Auth routes can treat the signer as the current user for that request.
 
 <Callout>
-  The middleware only runs for requests routed through `auth.handler`. For custom routes outside Better Auth, use `verifyRequest()` from `@slicekit/erc8128` directly.
+  The built-in middleware only runs for requests routed through `auth.handler`. For custom app routes outside Better Auth, use the plugin's server API so verification still goes through Better Auth storage, invalidation, and user-linking logic.
 </Callout>
+
+## Protect App Routes
+
+The plugin can protect arbitrary `Request` objects without forcing your app routes through fake Better Auth endpoints.
+
+```ts title="Using it from any framework"
+const result = await auth.api.erc8128.protect(request);
+
+if (!result.ok) {
+  return result.response;
+}
+
+if (result.principal) {
+  // `principal.user` and `principal.session` come from Better Auth infra
+}
+```
+
+`protect(request)` resolves `routePolicy`, verifies the signature, uses Better Auth storage for nonces/invalidation/cache, and returns the request-scoped principal. Public routes return `ok: true` with `authenticated: false`.
+
+If you want strict signature verification without policy-driven pass-through, use `auth.api.erc8128.verifyRequest(request)`.
 
 <Callout>
   For custom Better Auth or Better Call endpoints that both parse a request body and rely on ERC-8128 verification, set `cloneRequest: true`. Verification may need the original request bytes; without cloning, body parsing can consume the stream before downstream code or signature validation reads it.

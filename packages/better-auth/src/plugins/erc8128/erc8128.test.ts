@@ -472,6 +472,92 @@ describe("erc8128 plugin", () => {
 		});
 	});
 
+	describe("auth.api.erc8128", () => {
+		it("protects arbitrary app requests without routing them through auth.handler", async () => {
+			mockVerifier(async ({ request, policy }) => {
+				expect(new URL(request.url).pathname).toBe("/app/feed");
+				expect(policy).toMatchObject({
+					methods: ["GET"],
+					replayable: false,
+				});
+				return okResult({ replayable: false });
+			});
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							"/app/feed": {
+								methods: ["GET"],
+								replayable: false,
+							},
+						},
+					}),
+				],
+			});
+
+			const result = await auth.api.erc8128.protect(
+				new Request("http://localhost:3000/app/feed", {
+					method: "GET",
+					headers: {
+						signature: "sig-app-feed",
+						"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+					},
+				}),
+			);
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) {
+				return;
+			}
+
+			expect(result.protected).toBe(true);
+			expect(result.authenticated).toBe(true);
+			expect(result.source).toBe("signature");
+			expect(result.verification).toMatchObject({
+				ok: true,
+				address: defaultAddress,
+				chainId: defaultChainId,
+			});
+			expect(result.principal?.session.token).toContain("erc8128:");
+			expect(result.principal?.user.id).toBeDefined();
+		});
+
+		it("returns a 401 response for protected arbitrary routes without a signature", async () => {
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						routePolicy: {
+							"/app/feed": {
+								methods: ["GET"],
+								replayable: false,
+							},
+						},
+					}),
+				],
+			});
+
+			const result = await auth.api.erc8128.protect(
+				new Request("http://localhost:3000/app/feed", {
+					method: "GET",
+				}),
+			);
+
+			expect(result.ok).toBe(false);
+			if (result.ok) {
+				return;
+			}
+
+			expect(result.response.status).toBe(401);
+			await expect(result.response.json()).resolves.toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "missing_signature",
+			});
+		});
+	});
+
 	describe("hooks.before", () => {
 		it("middleware verifies signature, authenticates the request, and does not set a session cookie", async () => {
 			mockVerifier(async () => okResult());
@@ -547,6 +633,37 @@ describe("erc8128 plugin", () => {
 			expect(accounts).toHaveLength(1);
 		});
 
+		it("rejects protected per-request auth when the wallet is unlinked and anonymous onboarding is disabled", async () => {
+			mockVerifier(async () => okResult({ replayable: false }));
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						anonymous: false,
+						routePolicy: {
+							"/get-session": {
+								methods: ["GET"],
+								replayable: false,
+							},
+						},
+					}),
+				],
+			});
+
+			const { response, data } = await get(auth, "/get-session", {
+				headers: {
+					signature: "sig-unlinked-wallet",
+					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+				},
+			});
+
+			expect(response.status).toBe(401);
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "wallet_not_linked",
+			});
+		});
+
 		it("middleware links same address on different chain to existing user", async () => {
 			let call = 0;
 			mockVerifier(async () => {
@@ -590,7 +707,7 @@ describe("erc8128 plugin", () => {
 			expect(wallets[0]?.userId).toBe(wallets[1]?.userId);
 		});
 
-		it("middleware with anonymous: false silently passes through for unknown wallets (no email)", async () => {
+		it("middleware with anonymous: false rejects unknown wallets when it cannot create a user", async () => {
 			mockVerifier(async () => okResult());
 			const { auth } = await getTestInstance({
 				plugins: [
@@ -610,9 +727,11 @@ describe("erc8128 plugin", () => {
 					"signature-input": 'sig=("@method" "@target-uri" "@authority")',
 				},
 			});
-			expect(response.status).toBe(200);
-			// No session — user creation failed (no email)
-			expect(data === null || data.session === null).toBe(true);
+			expect(response.status).toBe(401);
+			expect(data).toMatchObject({
+				error: "erc8128_verification_failed",
+				reason: "wallet_not_linked",
+			});
 
 			// No wallet created
 			const wallets = await ctx.adapter.findMany({

@@ -1,5 +1,7 @@
 import type {
+	AuthContext,
 	BetterAuthPlugin,
+	BetterAuthOptions,
 	GenericEndpointContext,
 } from "@better-auth/core";
 import {
@@ -22,6 +24,7 @@ import { APIError } from "../../api";
 import { getSessionFromCtx } from "../../api/routes/session";
 import { setSessionCookie } from "../../cookies";
 import { mergeSchema } from "../../db/schema";
+import type { Auth } from "../../types";
 import type { InferOptionSchema, User } from "../../types";
 import { HIDE_METADATA } from "../../utils/hide-metadata";
 import { getOrigin } from "../../utils/url";
@@ -90,6 +93,75 @@ export function getErc8128Verification(
 	}
 	return value as Erc8128VerifiedRequest;
 }
+
+export interface Erc8128Principal {
+	session: Session & Record<string, any>;
+	user: User & Record<string, any>;
+}
+
+export interface Erc8128VerifyRequestOptions {
+	policy?: RoutePolicy | undefined;
+}
+
+export type Erc8128VerifyRequestResult =
+	| {
+			ok: true;
+			responseHeaders: Headers;
+			verification: Erc8128VerifiedRequest;
+	  }
+	| {
+			ok: false;
+			response: Response;
+			responseHeaders: Headers;
+	  };
+
+export interface Erc8128ProtectOptions {
+	resolveSession?: (() => Promise<Erc8128Principal | null>) | undefined;
+}
+
+export type Erc8128ProtectResult =
+	| {
+			ok: true;
+			authenticated: boolean;
+			principal: Erc8128Principal | null;
+			protected: boolean;
+			responseHeaders: Headers;
+			source: "none" | "session" | "signature";
+			verification: Erc8128VerifiedRequest | null;
+	  }
+	| {
+			ok: false;
+			protected: boolean;
+			response: Response;
+			responseHeaders: Headers;
+	  };
+
+export interface Erc8128ServerApi {
+	getConfig: (request?: Request) => Promise<Erc8128ServerConfig>;
+	protect: (
+		request: Request,
+		options?: Erc8128ProtectOptions,
+	) => Promise<Erc8128ProtectResult>;
+	verifyRequest: (
+		request: Request,
+		options?: Erc8128VerifyRequestOptions,
+	) => Promise<Erc8128VerifyRequestResult>;
+}
+
+export type Erc8128ServerConfig = ReturnType<typeof formatDiscoveryDocument> & {
+	capabilities: {
+		persistent_storage: boolean;
+		request_bound_middleware_only: boolean;
+	};
+};
+
+type BetterAuthPluginWithServerApi<API extends Record<string, unknown>> =
+	BetterAuthPlugin & {
+		getServerApi?: (
+			ctx: Promise<AuthContext> | AuthContext,
+		) => Record<string, unknown>;
+		$ServerAPI?: API;
+	};
 
 export interface ERC8128PluginOptions {
 	verifyMessage: VerifyMessageFn;
@@ -163,6 +235,108 @@ const invalidateBodySchema = z
 function extractKeyIdFromSignatureInput(signatureInput: string): string | null {
 	const match = signatureInput.match(/(?:^|;)\s*keyid="([^"]+)"/i);
 	return match?.[1] ?? null;
+}
+
+const WWW_AUTHENTICATE_HEADER =
+	'Signature realm="erc8128", headers="@method @target-uri @authority"';
+
+function toHeaders(headers: Record<string, string>) {
+	return new Headers(headers);
+}
+
+function jsonErrorResponse(
+	status: number,
+	body: Record<string, unknown>,
+	headers?: Record<string, string>,
+) {
+	return new Response(JSON.stringify(body), {
+		status,
+		headers: {
+			"Content-Type": "application/json",
+			...(headers ?? {}),
+		},
+	});
+}
+
+function cloneAuthContextForRequest<Options extends BetterAuthOptions>(
+	authContext: AuthContext<Options>,
+	request?: Request,
+) {
+	const context = Object.create(
+		Object.getPrototypeOf(authContext),
+		Object.getOwnPropertyDescriptors(authContext),
+	) as AuthContext<Options>;
+
+	if (!context.baseURL && request) {
+		context.baseURL = new URL(
+			authContext.options.basePath || "/api/auth",
+			request.url,
+		).toString();
+	}
+
+	return context;
+}
+
+function withoutSignatureHeaders(request: Request) {
+	const headers = new Headers(request.headers);
+	headers.delete("signature");
+	headers.delete("signature-input");
+	return headers;
+}
+
+async function requireErc8128Context<Options extends BetterAuthOptions>(
+	auth: Auth<Options>,
+) {
+	const ctx = await auth.$context;
+	if (!("erc8128" in ctx) || !ctx.erc8128) {
+		throw new Error(
+			"[better-auth][erc8128] ERC-8128 plugin is not installed on this auth instance.",
+		);
+	}
+	return ctx.erc8128 as Erc8128ServerApi;
+}
+
+export function getErc8128Api<Options extends BetterAuthOptions>(
+	auth: Auth<Options>,
+): Erc8128ServerApi {
+	if ((auth.api as Record<string, unknown>).erc8128) {
+		return (auth.api as Record<string, unknown>).erc8128 as Erc8128ServerApi;
+	}
+	return {
+		getConfig: async (request) => {
+			const api = await requireErc8128Context(auth);
+			return api.getConfig(request);
+		},
+		protect: async (request, options) => {
+			const api = await requireErc8128Context(auth);
+			const protectOptions: Erc8128ProtectOptions = {
+				resolveSession:
+					options?.resolveSession ??
+					(async () => {
+						const session = await auth.api
+							.getSession(
+								{
+									headers: withoutSignatureHeaders(request),
+									request,
+								} as any,
+							)
+							.catch(() => null);
+
+						return session
+							? {
+									session: session.session as Session & Record<string, any>,
+									user: session.user as User & Record<string, any>,
+								}
+							: null;
+					}),
+			};
+			return api.protect(request, protectOptions);
+		},
+		verifyRequest: async (request, options) => {
+			const api = await requireErc8128Context(auth);
+			return api.verifyRequest(request, options);
+		},
+	};
 }
 
 export const erc8128 = (options: ERC8128PluginOptions) => {
@@ -478,9 +652,448 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			path: ["email"],
 		});
 
+	const createRequestContext = (
+		authContext: AuthContext<BetterAuthOptions>,
+		request: Request,
+	): GenericEndpointContext => {
+		return {
+			request,
+			headers: request.headers,
+			context: cloneAuthContextForRequest(authContext, request),
+		} as GenericEndpointContext;
+	};
+
+	const getServerConfig = async (
+		ctx: GenericEndpointContext,
+	): Promise<Erc8128ServerConfig> => {
+		await ensureStorageMode(ctx);
+		const baseURL = ctx.context.baseURL;
+
+		return {
+			...formatDiscoveryDocument({
+				verificationEndpoint:
+					storageMode === "none" ? undefined : `${baseURL}/erc8128/verify`,
+				invalidationEndpoint:
+					replayableEnabled && storageMode !== "none"
+						? `${baseURL}/erc8128/invalidate`
+						: undefined,
+				maxValiditySec: options.maxValiditySec,
+				routePolicy: options.routePolicy
+					? normalizeRoutePolicyConfig(options.routePolicy, baseURL)
+					: undefined,
+			}),
+			capabilities: {
+				persistent_storage: storageMode !== "none",
+				request_bound_middleware_only: storageMode === "none",
+			},
+		};
+	};
+
+	const verifyRequestInternal = async (
+		ctx: GenericEndpointContext,
+		request: Request,
+		policy?: RoutePolicy,
+	): Promise<Erc8128VerifyRequestResult> => {
+		await ensureStorageMode(ctx);
+		if (storageMode === "none" && policy?.replayable) {
+			warnReplayableNoStorage();
+			return {
+				ok: false,
+				response: jsonErrorResponse(
+					401,
+					{
+						error: "erc8128_verification_failed",
+						reason: "replayable_requires_storage",
+						detail:
+							"Replayable route policy requires database or secondaryStorage",
+					},
+					{
+						"WWW-Authenticate": WWW_AUTHENTICATE_HEADER,
+					},
+				),
+				responseHeaders: new Headers({
+					"WWW-Authenticate": WWW_AUTHENTICATE_HEADER,
+				}),
+			};
+		}
+
+		const signature = request.headers.get("signature");
+		const signatureInput = request.headers.get("signature-input");
+		if (!signature || !signatureInput) {
+			const responseHeaders = new Headers({
+				"WWW-Authenticate": WWW_AUTHENTICATE_HEADER,
+			});
+			return {
+				ok: false,
+				response: jsonErrorResponse(
+					401,
+					{
+						error: "erc8128_verification_failed",
+						reason: "missing_signature",
+						detail: "Signature and Signature-Input headers are required",
+					},
+					Object.fromEntries(responseHeaders.entries()),
+				),
+				responseHeaders,
+			};
+		}
+
+		const invalidationOps =
+			replayableEnabled && storageMode !== "none"
+				? getInvalidationOps(ctx)
+				: null;
+		const hintedKeyId =
+			extractKeyIdFromSignatureInput(signatureInput)?.toLowerCase() ?? null;
+		const prefetchedKeyIdInvalidations =
+			invalidationOps && hintedKeyId
+				? invalidationOps.findByKeyId(hintedKeyId)
+				: null;
+		const prefetchedSignatureInvalidation = invalidationOps
+			? invalidationOps.findBySignature(signature)
+			: null;
+
+		const getKeyIdInvalidations = (keyid: string) => {
+			const normalizedKeyId = keyid.toLowerCase();
+			if (prefetchedKeyIdInvalidations && hintedKeyId === normalizedKeyId) {
+				return prefetchedKeyIdInvalidations;
+			}
+			return invalidationOps
+				? invalidationOps.findByKeyId(normalizedKeyId)
+				: Promise.resolve([]);
+		};
+
+		const getSignatureInvalidation = (value: string) => {
+			if (prefetchedSignatureInvalidation && value === signature) {
+				return prefetchedSignatureInvalidation;
+			}
+			return invalidationOps
+				? invalidationOps.findBySignature(value)
+				: Promise.resolve(null);
+		};
+
+		const verifier = createVerifierClient({
+			verifyMessage: createCachedVerifyMessage(ctx),
+			nonceStore: getNonceStore(ctx),
+			defaults: {
+				maxValiditySec: options.maxValiditySec,
+				clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
+				maxSignatureVerifications: MAX_SIGNATURE_VERIFICATIONS,
+				...(replayableEnabled
+					? {
+							replayableNotBefore: async (keyid: string) => {
+								const records = await getKeyIdInvalidations(keyid);
+								const keyRecord = records.find((record) => !record.signature);
+								return keyRecord?.notBefore ?? null;
+							},
+							replayableInvalidated: async ({ keyid, signature }) => {
+								const record = await getSignatureInvalidation(signature);
+								return !!(
+									record &&
+									(!record.keyId || record.keyId === keyid.toLowerCase())
+								);
+							},
+						}
+					: {}),
+			},
+		});
+
+		const responseHeaders: Record<string, string> = {};
+		const result = await verifier.verifyRequest({
+			request,
+			policy,
+			setHeaders: (name, value) => {
+				responseHeaders[name] = value;
+			},
+		});
+
+		if (!result.ok) {
+			const reason =
+				result.reason === "replayable_invalidated"
+					? "signature_invalidated"
+					: result.reason;
+			const detail =
+				result.reason === "replayable_invalidated"
+					? "Signature has been explicitly invalidated"
+					: result.detail;
+			return {
+				ok: false,
+				response: jsonErrorResponse(
+					401,
+					{
+						error: "erc8128_verification_failed",
+						reason,
+						detail,
+					},
+					responseHeaders,
+				),
+				responseHeaders: toHeaders(responseHeaders),
+			};
+		}
+
+		return {
+			ok: true,
+			responseHeaders: toHeaders(responseHeaders),
+			verification: result,
+		};
+	};
+
+	const protectRequestInternal = async (
+		ctx: GenericEndpointContext,
+		request: Request,
+		protectOptions?: Erc8128ProtectOptions,
+	): Promise<Erc8128ProtectResult> => {
+		const resolvedRoutePolicy = resolveRoutePolicy(
+			options.routePolicy,
+			request,
+			ctx.context.baseURL,
+		);
+
+		if (resolvedRoutePolicy.skipVerification) {
+			return {
+				ok: true,
+				authenticated: false,
+				principal: null,
+				protected: false,
+				responseHeaders: new Headers(),
+				source: "none",
+				verification: null,
+			};
+		}
+
+		const precedence = options.authPrecedence ?? "session-first";
+		const currentSession =
+			protectOptions?.resolveSession &&
+			request.headers.get("cookie")?.includes(
+				ctx.context.authCookies.sessionToken.name,
+			)
+				? await protectOptions.resolveSession()
+				: null;
+
+		if (currentSession && precedence === "session-first") {
+			return {
+				ok: true,
+				authenticated: true,
+				principal: currentSession,
+				protected: resolvedRoutePolicy.requireAuth,
+				responseHeaders: new Headers(),
+				source: "session",
+				verification: null,
+			};
+		}
+
+		const hasSignatureHeaders =
+			!!request.headers.get("signature") &&
+			!!request.headers.get("signature-input");
+		if (!hasSignatureHeaders) {
+			if (!resolvedRoutePolicy.requireAuth) {
+				return {
+					ok: true,
+					authenticated: false,
+					principal: null,
+					protected: false,
+					responseHeaders: new Headers(),
+					source: "none",
+					verification: null,
+				};
+			}
+
+			return {
+				ok: false,
+				protected: true,
+				response: jsonErrorResponse(
+					401,
+					{
+						error: "erc8128_verification_failed",
+						reason: "missing_signature",
+						detail: "Signature and Signature-Input headers are required",
+					},
+					{
+						"WWW-Authenticate": WWW_AUTHENTICATE_HEADER,
+					},
+				),
+				responseHeaders: new Headers({
+					"WWW-Authenticate": WWW_AUTHENTICATE_HEADER,
+				}),
+			};
+		}
+
+		const verificationResult = await verifyRequestInternal(
+			ctx,
+			request,
+			resolvedRoutePolicy.policy,
+		);
+		if (!verificationResult.ok) {
+			if (!resolvedRoutePolicy.requireAuth) {
+				return {
+					ok: true,
+					authenticated: false,
+					principal: null,
+					protected: false,
+					responseHeaders: verificationResult.responseHeaders,
+					source: "none",
+					verification: null,
+				};
+			}
+			return {
+				ok: false,
+				protected: true,
+				response: verificationResult.response,
+				responseHeaders: verificationResult.responseHeaders,
+			};
+		}
+
+		const walletUser = await findOrCreateWalletUser(
+			ctx,
+			verificationResult.verification.address,
+			verificationResult.verification.chainId,
+		);
+
+		if (!walletUser) {
+			return {
+				ok: false,
+				protected: resolvedRoutePolicy.requireAuth,
+				response: jsonErrorResponse(
+					401,
+					{
+						error: "erc8128_verification_failed",
+						reason: "wallet_not_linked",
+						detail:
+							"Wallet is not linked to a Better Auth user and anonymous onboarding is disabled",
+					},
+				),
+				responseHeaders: new Headers(),
+			};
+		}
+
+		if (
+			currentSession &&
+			precedence === "reject-on-mismatch" &&
+			currentSession.user.id !== walletUser.id
+		) {
+			return {
+				ok: false,
+				protected: resolvedRoutePolicy.requireAuth,
+				response: jsonErrorResponse(401, {
+					error: "erc8128_verification_failed",
+					reason: "identity_mismatch",
+					detail: "Session user does not match signature identity",
+				}),
+				responseHeaders: new Headers(),
+			};
+		}
+
+		const principal =
+			currentSession && precedence === "reject-on-mismatch"
+				? currentSession
+				: createEphemeralSignatureSession(
+						walletUser,
+						verificationResult.verification,
+						request,
+					);
+
+		return {
+			ok: true,
+			authenticated: true,
+			principal,
+			protected: resolvedRoutePolicy.requireAuth,
+			responseHeaders: verificationResult.responseHeaders,
+			source: "signature",
+			verification: verificationResult.verification,
+		};
+	};
+
 	return {
 		id: "erc8128",
+		getServerApi(ctx: Promise<AuthContext> | AuthContext) {
+			return {
+				erc8128: {
+					getConfig: async (request?: Request) => {
+						const authContext = await ctx;
+						if (!("erc8128" in authContext) || !authContext.erc8128) {
+							throw new Error(
+								"[better-auth][erc8128] ERC-8128 server API unavailable.",
+							);
+						}
+						return (
+							authContext.erc8128 as Erc8128ServerApi
+						).getConfig(request);
+					},
+					protect: async (
+						request: Request,
+						protectOptions?: Erc8128ProtectOptions,
+					) => {
+						const authContext = await ctx;
+						if (!("erc8128" in authContext) || !authContext.erc8128) {
+							throw new Error(
+								"[better-auth][erc8128] ERC-8128 server API unavailable.",
+							);
+						}
+						return (
+							authContext.erc8128 as Erc8128ServerApi
+						).protect(request, protectOptions);
+					},
+					verifyRequest: async (
+						request: Request,
+						verifyOptions?: Erc8128VerifyRequestOptions,
+					) => {
+						const authContext = await ctx;
+						if (!("erc8128" in authContext) || !authContext.erc8128) {
+							throw new Error(
+								"[better-auth][erc8128] ERC-8128 server API unavailable.",
+							);
+						}
+						return (
+							authContext.erc8128 as Erc8128ServerApi
+						).verifyRequest(request, verifyOptions);
+					},
+				} satisfies Erc8128ServerApi,
+			};
+		},
 		schema: mergeSchema(schema, options?.schema) as ERC8128Schema,
+		init(ctx) {
+			return {
+				context: {
+					erc8128: {
+						getConfig: async (request?: Request) =>
+							getServerConfig(
+								createRequestContext(
+									ctx as AuthContext<BetterAuthOptions>,
+									request ??
+										new Request(
+											ctx.baseURL ||
+												"http://localhost" +
+													(ctx.options.basePath || "/api/auth"),
+										),
+								),
+							),
+						protect: async (
+							request: Request,
+							protectOptions?: Erc8128ProtectOptions,
+						) =>
+							protectRequestInternal(
+								createRequestContext(
+									ctx as AuthContext<BetterAuthOptions>,
+									request,
+								),
+								request,
+								protectOptions,
+							),
+						verifyRequest: async (
+							request: Request,
+							verifyOptions?: Erc8128VerifyRequestOptions,
+						) =>
+							verifyRequestInternal(
+								createRequestContext(
+									ctx as AuthContext<BetterAuthOptions>,
+									request,
+								),
+								request,
+								verifyOptions?.policy,
+							),
+					} satisfies Erc8128ServerApi,
+				},
+			};
+		},
 		hooks: {
 			before: [
 				{
@@ -506,21 +1119,15 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						);
 					},
 					handler: createAuthMiddleware(async (ctx: GenericEndpointContext) => {
-						const incomingHeaders = (ctx.request?.headers || ctx.headers) as
-							| Headers
-							| undefined;
-						if (!incomingHeaders) {
+						if (!ctx.request) {
 							return;
 						}
 
-						if (
-							ctx.request &&
-							isPluginEndpoint(ctx.request, ctx.context.baseURL)
-						) {
+						if (isPluginEndpoint(ctx.request, ctx.context.baseURL)) {
 							return;
 						}
 
-						const cookieHeader = incomingHeaders.get("cookie") || "";
+						const cookieHeader = ctx.request.headers.get("cookie") || "";
 						const hasSessionCookie = cookieHeader.includes(
 							ctx.context.authCookies.sessionToken.name,
 						);
@@ -531,249 +1138,33 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							return;
 						}
 
-						const resolvedRoutePolicy = ctx.request
-							? resolveRoutePolicy(
-									options.routePolicy,
-									ctx.request,
-									ctx.context.baseURL,
-								)
-							: ({
-									policy: undefined,
-									requireAuth: false,
-									skipVerification: false,
-								} as const);
-						if (resolvedRoutePolicy.skipVerification) {
-							return;
-						}
-
-						await ensureStorageMode(ctx);
-						if (storageMode === "none") {
-							if (!resolvedRoutePolicy.requireAuth) {
-								// In stateless mode, only explicitly protected routes run middleware.
-								return;
-							}
-							if (resolvedRoutePolicy.policy?.replayable) {
-								warnReplayableNoStorage();
-								return new Response(
-									JSON.stringify({
-										error: "erc8128_verification_failed",
-										reason: "replayable_requires_storage",
-										detail:
-											"Replayable route policy requires database or secondaryStorage",
-									}),
-									{
-										status: 401,
-										headers: { "Content-Type": "application/json" },
-									},
-								);
-							}
-						}
-
-						const signature = incomingHeaders.get("signature");
-						const signatureInput = incomingHeaders.get("signature-input");
-						const hasSignatureHeaders = !!signature && !!signatureInput;
-
-						if (!hasSignatureHeaders) {
-							if (!resolvedRoutePolicy.requireAuth) {
-								return;
-							}
-							return new Response(
-								JSON.stringify({
-									error: "erc8128_verification_failed",
-									reason: "missing_signature",
-									detail: "Signature and Signature-Input headers are required",
-								}),
-								{
-									status: 401,
-									headers: {
-										"Content-Type": "application/json",
-										"WWW-Authenticate":
-											'Signature realm="erc8128", headers="@method @target-uri @authority"',
-									},
-								},
-							);
-						}
-
-						const invalidationOps =
-							replayableEnabled && storageMode !== "none"
-								? getInvalidationOps(ctx)
-								: null;
-						const hintedKeyId = signatureInput
-							? (extractKeyIdFromSignatureInput(
-									signatureInput,
-								)?.toLowerCase() ?? null)
-							: null;
-						const prefetchedKeyIdInvalidations =
-							invalidationOps && hintedKeyId
-								? invalidationOps.findByKeyId(hintedKeyId)
-								: null;
-						const prefetchedSignatureInvalidation =
-							invalidationOps && signature
-								? invalidationOps.findBySignature(signature)
-								: null;
-
-						const getKeyIdInvalidations = (keyid: string) => {
-							const normalizedKeyId = keyid.toLowerCase();
-							if (
-								prefetchedKeyIdInvalidations &&
-								hintedKeyId === normalizedKeyId
-							) {
-								return prefetchedKeyIdInvalidations;
-							}
-							return invalidationOps
-								? invalidationOps.findByKeyId(normalizedKeyId)
-								: Promise.resolve([]);
-						};
-
-						const getSignatureInvalidation = (value: string) => {
-							if (prefetchedSignatureInvalidation && value === signature) {
-								return prefetchedSignatureInvalidation;
-							}
-							return invalidationOps
-								? invalidationOps.findBySignature(value)
-								: Promise.resolve(null);
-						};
-
-						const verifier = createVerifierClient({
-							verifyMessage: createCachedVerifyMessage(ctx),
-							nonceStore: getNonceStore(ctx),
-							defaults: {
-								maxValiditySec: options.maxValiditySec,
-								clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
-								maxSignatureVerifications: MAX_SIGNATURE_VERIFICATIONS,
-								...(replayableEnabled
-									? {
-											replayableNotBefore: async (keyid: string) => {
-												const records = await getKeyIdInvalidations(keyid);
-												const keyRecord = records.find((r) => !r.signature);
-												return keyRecord?.notBefore ?? null;
-											},
-											replayableInvalidated: async ({ keyid, signature }) => {
-												const record =
-													await getSignatureInvalidation(signature);
-												return !!(
-													record &&
-													(!record.keyId ||
-														record.keyId === keyid.toLowerCase())
-												);
-											},
+						const result = await protectRequestInternal(ctx, ctx.request, {
+							resolveSession:
+								hasSessionCookie && precedence === "reject-on-mismatch"
+									? async () => {
+											const session = await getSessionFromCtx(ctx);
+											return session
+												? {
+														session: session.session,
+														user: session.user,
+													}
+												: null;
 										}
-									: {}),
-							},
+									: undefined,
 						});
 
-						const responseHeaders: Record<string, string> = {};
-
-						if (!ctx.request) {
-							if (!resolvedRoutePolicy.requireAuth) {
-								return;
-							}
-							return new Response(
-								JSON.stringify({
-									error: "erc8128_verification_failed",
-									reason: "missing_request_context",
-									detail: "Unable to verify signature without request context",
-								}),
-								{
-									status: 401,
-									headers: {
-										"Content-Type": "application/json",
-										"WWW-Authenticate":
-											'Signature realm="erc8128", headers="@method @target-uri @authority"',
-									},
-								},
-							);
-						}
-
-						const result = await verifier.verifyRequest({
-							request: ctx.request,
-							policy: resolvedRoutePolicy.policy,
-							setHeaders: (name, value) => {
-								responseHeaders[name] = value;
-							},
-						});
 						if (!result.ok) {
-							if (!resolvedRoutePolicy.requireAuth) {
-								return;
-							}
-							const reason =
-								result.reason === "replayable_invalidated"
-									? "signature_invalidated"
-									: result.reason;
-							const detail =
-								result.reason === "replayable_invalidated"
-									? "Signature has been explicitly invalidated"
-									: result.detail;
-							return new Response(
-								JSON.stringify({
-									error: "erc8128_verification_failed",
-									reason,
-									detail,
-								}),
-								{
-									status: 401,
-									headers: {
-										"Content-Type": "application/json",
-										...responseHeaders,
-									},
-								},
-							);
+							return result.response;
 						}
 
-						(ctx.context as typeof ctx.context & Record<string, unknown>)[
-							ERC8128_VERIFICATION_CONTEXT_KEY
-						] = result;
-
-						const walletAddress = result.address;
-						const chainId = result.chainId;
-						const walletUser = await findOrCreateWalletUser(
-							ctx,
-							walletAddress,
-							chainId,
-						);
-
-						// reject-on-mismatch: if both session and signature are present
-						// and resolve to different users, reject the request
-						if (hasSessionCookie && precedence === "reject-on-mismatch") {
-							const currentSession = await getSessionFromCtx(ctx);
-							if (
-								currentSession &&
-								walletUser &&
-								currentSession.user.id !== walletUser.id
-							) {
-								return new Response(
-									JSON.stringify({
-										error: "erc8128_verification_failed",
-										reason: "identity_mismatch",
-										detail: "Session user does not match signature identity",
-									}),
-									{
-										status: 401,
-										headers: {
-											"Content-Type": "application/json",
-										},
-									},
-								);
-							}
-							if (!currentSession && walletUser) {
-								ctx.context.session = createEphemeralSignatureSession(
-									walletUser,
-									result,
-									ctx.request,
-								);
-							}
-							return;
+						if (result.verification) {
+							(ctx.context as typeof ctx.context & Record<string, unknown>)[
+								ERC8128_VERIFICATION_CONTEXT_KEY
+							] = result.verification;
 						}
 
-						if (
-							walletUser &&
-							(precedence === "signature-first" || !hasSessionCookie)
-						) {
-							ctx.context.session = createEphemeralSignatureSession(
-								walletUser,
-								result,
-								ctx.request,
-							);
+						if (result.principal && result.source === "signature") {
+							ctx.context.session = result.principal;
 						}
 					}),
 				},
@@ -786,31 +1177,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					method: "GET",
 					metadata: HIDE_METADATA,
 				},
-				async (ctx) => {
-					await ensureStorageMode(ctx);
-					const baseURL = ctx.context.baseURL;
-
-					return ctx.json({
-						...formatDiscoveryDocument({
-							verificationEndpoint:
-								storageMode === "none"
-									? undefined
-									: `${baseURL}/erc8128/verify`,
-							invalidationEndpoint:
-								replayableEnabled && storageMode !== "none"
-									? `${baseURL}/erc8128/invalidate`
-									: undefined,
-							maxValiditySec: options.maxValiditySec,
-							routePolicy: options.routePolicy
-								? normalizeRoutePolicyConfig(options.routePolicy, baseURL)
-								: undefined,
-						}),
-						capabilities: {
-							persistent_storage: storageMode !== "none",
-							request_bound_middleware_only: storageMode === "none",
-						},
-					});
-				},
+				async (ctx) => ctx.json(await getServerConfig(ctx)),
 			),
 			verifyErc8128: createAuthEndpoint(
 				"/erc8128/verify",
@@ -1010,5 +1377,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				: {}),
 		},
 		options,
-	} satisfies BetterAuthPlugin;
+		$ServerAPI: {
+			erc8128: {} as Erc8128ServerApi,
+		},
+	} satisfies BetterAuthPluginWithServerApi<{ erc8128: Erc8128ServerApi }>;
 };
