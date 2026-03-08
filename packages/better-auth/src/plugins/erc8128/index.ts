@@ -1,7 +1,7 @@
 import type {
 	AuthContext,
-	BetterAuthPlugin,
 	BetterAuthOptions,
+	BetterAuthPlugin,
 	GenericEndpointContext,
 } from "@better-auth/core";
 import {
@@ -24,8 +24,7 @@ import { APIError } from "../../api";
 import { getSessionFromCtx } from "../../api/routes/session";
 import { setSessionCookie } from "../../cookies";
 import { mergeSchema } from "../../db/schema";
-import type { Auth } from "../../types";
-import type { InferOptionSchema, User } from "../../types";
+import type { Auth, InferOptionSchema, User } from "../../types";
 import { HIDE_METADATA } from "../../utils/hide-metadata";
 import { getOrigin } from "../../utils/url";
 import type { InvalidationOps } from "./invalidation-store";
@@ -314,12 +313,10 @@ export function getErc8128Api<Options extends BetterAuthOptions>(
 					options?.resolveSession ??
 					(async () => {
 						const session = await auth.api
-							.getSession(
-								{
-									headers: withoutSignatureHeaders(request),
-									request,
-								} as any,
-							)
+							.getSession({
+								headers: withoutSignatureHeaders(request),
+								request,
+							} as any)
 							.catch(() => null);
 
 						return session
@@ -863,9 +860,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 		const precedence = options.authPrecedence ?? "session-first";
 		const currentSession =
 			protectOptions?.resolveSession &&
-			request.headers.get("cookie")?.includes(
-				ctx.context.authCookies.sessionToken.name,
-			)
+			request.headers
+				.get("cookie")
+				?.includes(ctx.context.authCookies.sessionToken.name)
 				? await protectOptions.resolveSession()
 				: null;
 
@@ -952,15 +949,12 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			return {
 				ok: false,
 				protected: resolvedRoutePolicy.requireAuth,
-				response: jsonErrorResponse(
-					401,
-					{
-						error: "erc8128_verification_failed",
-						reason: "wallet_not_linked",
-						detail:
-							"Wallet is not linked to a Better Auth user and anonymous onboarding is disabled",
-					},
-				),
+				response: jsonErrorResponse(401, {
+					error: "erc8128_verification_failed",
+					reason: "wallet_not_linked",
+					detail:
+						"Wallet is not linked to a Better Auth user and anonymous onboarding is disabled",
+				}),
 				responseHeaders: new Headers(),
 			};
 		}
@@ -1014,9 +1008,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								"[better-auth][erc8128] ERC-8128 server API unavailable.",
 							);
 						}
-						return (
-							authContext.erc8128 as Erc8128ServerApi
-						).getConfig(request);
+						return (authContext.erc8128 as Erc8128ServerApi).getConfig(request);
 					},
 					protect: async (
 						request: Request,
@@ -1028,9 +1020,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								"[better-auth][erc8128] ERC-8128 server API unavailable.",
 							);
 						}
-						return (
-							authContext.erc8128 as Erc8128ServerApi
-						).protect(request, protectOptions);
+						return (authContext.erc8128 as Erc8128ServerApi).protect(
+							request,
+							protectOptions,
+						);
 					},
 					verifyRequest: async (
 						request: Request,
@@ -1042,9 +1035,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								"[better-auth][erc8128] ERC-8128 server API unavailable.",
 							);
 						}
-						return (
-							authContext.erc8128 as Erc8128ServerApi
-						).verifyRequest(request, verifyOptions);
+						return (authContext.erc8128 as Erc8128ServerApi).verifyRequest(
+							request,
+							verifyOptions,
+						);
 					},
 				} satisfies Erc8128ServerApi,
 			};
