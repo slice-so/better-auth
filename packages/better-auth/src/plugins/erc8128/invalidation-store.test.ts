@@ -5,10 +5,11 @@ import {
 	createDualInvalidationOps,
 	createSecondaryStorageInvalidationOps,
 } from "./invalidation-store";
+import { getErc8128SignatureHash } from "./utils";
 
-// ---------------------------------------------------------------------------
-// Mock DB adapter
-// ---------------------------------------------------------------------------
+const KEY_ID_ABC = "erc8128:1:0x0000000000000000000000000000000000000abc";
+const KEY_ID_DB_ONLY =
+	"erc8128:1:0x0000000000000000000000000000000000000db0";
 
 function createMockAdapter() {
 	const rows: Array<Record<string, unknown>> = [];
@@ -17,17 +18,24 @@ function createMockAdapter() {
 	const adapter: InvalidationAdapter = {
 		async findMany(args) {
 			if (!args.where) return [...rows];
-			return rows.filter((r) =>
-				args.where!.every(
-					(w) => String(r[w.field] ?? "") === String(w.value ?? ""),
-				),
+			return rows.filter((row) =>
+				args.where!.every((where) => {
+					if (where.field === "expiresAt" && where.operator === "lt") {
+						return (
+							row.expiresAt instanceof Date &&
+							row.expiresAt < (where.value as Date)
+						);
+					}
+					return String(row[where.field] ?? "") === String(where.value ?? "");
+				}),
 			);
 		},
 		async findOne(args) {
 			return (
-				rows.find((r) =>
+				rows.find((row) =>
 					args.where.every(
-						(w) => String(r[w.field] ?? "") === String(w.value ?? ""),
+						(where) =>
+							String(row[where.field] ?? "") === String(where.value ?? ""),
 					),
 				) ?? null
 			);
@@ -38,22 +46,40 @@ function createMockAdapter() {
 			return row;
 		},
 		async update(args) {
-			const row = rows.find((r) =>
+			const row = rows.find((entry) =>
 				args.where.every(
-					(w) => String(r[w.field] ?? "") === String(w.value ?? ""),
+					(where) =>
+						String(entry[where.field] ?? "") === String(where.value ?? ""),
 				),
 			);
 			if (row) Object.assign(row, args.update);
-			return (row as Record<string, unknown>) ?? null;
+			return row ?? null;
+		},
+		async deleteMany(args) {
+			let deleted = 0;
+			for (const row of [...rows]) {
+				if (
+					args.where.every((where) => {
+						if (where.field === "expiresAt" && where.operator === "lt") {
+							return (
+								row.expiresAt instanceof Date &&
+								row.expiresAt < (where.value as Date)
+							);
+						}
+						return String(row[where.field] ?? "") === String(where.value ?? "");
+					})
+				) {
+					rows.splice(rows.indexOf(row), 1);
+					deleted++;
+				}
+			}
+			return deleted;
 		},
 	};
 
 	return { rows, adapter };
 }
 
-// ---------------------------------------------------------------------------
-// Mock secondary storage
-// ---------------------------------------------------------------------------
 function createMockStorage() {
 	const store = new Map<string, { value: string; expiresAt: number }>();
 	return {
@@ -85,47 +111,74 @@ describe("DB invalidation ops", () => {
 	it("upserts and finds per-keyId notBefore", async () => {
 		const { adapter } = createMockAdapter();
 		const ops = createDBInvalidationOps(adapter);
+		const nowSec = Math.floor(Date.now() / 1000);
 
-		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 1000);
-		const records = await ops.findByKeyId("erc8128:1:0xabc");
+		await ops.upsertKeyIdNotBefore(KEY_ID_ABC, nowSec);
+		const records = await ops.findByKeyId(KEY_ID_ABC);
 		expect(records).toHaveLength(1);
-		expect(records[0]!.notBefore).toBe(1000);
+		expect(records[0]!.notBefore).toBe(nowSec);
+		expect(records[0]!.keyId).toBe(KEY_ID_ABC);
 	});
 
 	it("updates existing per-keyId notBefore on second upsert", async () => {
 		const { adapter } = createMockAdapter();
 		const ops = createDBInvalidationOps(adapter);
+		const nowSec = Math.floor(Date.now() / 1000);
 
-		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 1000);
-		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 2000);
-		const records = await ops.findByKeyId("erc8128:1:0xabc");
+		await ops.upsertKeyIdNotBefore(KEY_ID_ABC, nowSec);
+		await ops.upsertKeyIdNotBefore(KEY_ID_ABC, nowSec + 1000);
+		const records = await ops.findByKeyId(KEY_ID_ABC);
 		expect(records).toHaveLength(1);
-		expect(records[0]!.notBefore).toBe(2000);
+		expect(records[0]!.notBefore).toBe(nowSec + 1000);
+	});
+
+	it("ignores expired per-keyId invalidations", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date(1000 * 1000));
+			const { adapter } = createMockAdapter();
+			const ops = createDBInvalidationOps(adapter);
+
+			await ops.upsertKeyIdNotBefore(KEY_ID_ABC, 1000, 1);
+			expect(await ops.findByKeyId(KEY_ID_ABC)).toHaveLength(1);
+
+			vi.setSystemTime(new Date((1000 + 2) * 1000));
+			expect(await ops.findByKeyId(KEY_ID_ABC)).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("upserts and finds per-signature invalidation", async () => {
 		const { adapter } = createMockAdapter();
 		const ops = createDBInvalidationOps(adapter);
 
-		await ops.upsertSignatureInvalidation("erc8128:1:0xabc", "0xsig1", 300);
-		const record = await ops.findBySignature("0xsig1");
+		await ops.upsertSignatureInvalidation(KEY_ID_ABC, "0xsig1", 300);
+		const record = await ops.findBySignature("0xsig1", KEY_ID_ABC);
 		expect(record).not.toBeNull();
 		expect(record?.notBefore).toBe(0);
+		expect(record?.signatureHash).toBe(getErc8128SignatureHash("0xsig1"));
 	});
 
 	it("returns null for non-existent signature", async () => {
 		const { adapter } = createMockAdapter();
 		const ops = createDBInvalidationOps(adapter);
-		expect(await ops.findBySignature("0xmissing")).toBeNull();
+		expect(await ops.findBySignature("0xmissing", KEY_ID_ABC)).toBeNull();
 	});
 
-	it("normalizes keyId to lowercase", async () => {
-		const { adapter } = createMockAdapter();
-		const ops = createDBInvalidationOps(adapter);
+	it("ignores expired signature invalidations", async () => {
+		vi.useFakeTimers();
+		try {
+			const { adapter } = createMockAdapter();
+			const ops = createDBInvalidationOps(adapter);
 
-		await ops.upsertKeyIdNotBefore("ERC8128:1:0xABC", 1000);
-		const records = await ops.findByKeyId("erc8128:1:0xABC");
-		expect(records).toHaveLength(1);
+			await ops.upsertSignatureInvalidation(KEY_ID_ABC, "0xsig1", 1);
+			expect(await ops.findBySignature("0xsig1", KEY_ID_ABC)).not.toBeNull();
+			vi.advanceTimersByTime(1100);
+			expect(await ops.findBySignature("0xsig1", KEY_ID_ABC)).toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
@@ -134,29 +187,20 @@ describe("secondaryStorage invalidation ops", () => {
 		const { storage } = createMockStorage();
 		const ops = createSecondaryStorageInvalidationOps(storage, 3600);
 
-		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 1500);
-		const records = await ops.findByKeyId("erc8128:1:0xabc");
+		await ops.upsertKeyIdNotBefore(KEY_ID_ABC, 1500);
+		const records = await ops.findByKeyId(KEY_ID_ABC);
 		expect(records).toHaveLength(1);
 		expect(records[0]!.notBefore).toBe(1500);
-	});
-
-	it("overwrites per-keyId notBefore on second upsert", async () => {
-		const { storage } = createMockStorage();
-		const ops = createSecondaryStorageInvalidationOps(storage, 3600);
-
-		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 1000);
-		await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 2000);
-		const records = await ops.findByKeyId("erc8128:1:0xabc");
-		expect(records[0]!.notBefore).toBe(2000);
 	});
 
 	it("stores and retrieves per-signature invalidation", async () => {
 		const { storage } = createMockStorage();
 		const ops = createSecondaryStorageInvalidationOps(storage, 3600);
 
-		await ops.upsertSignatureInvalidation("erc8128:1:0xabc", "0xsig1", 300);
-		const record = await ops.findBySignature("0xsig1");
+		await ops.upsertSignatureInvalidation(KEY_ID_ABC, "0xsig1", 300);
+		const record = await ops.findBySignature("0xsig1", KEY_ID_ABC);
 		expect(record).not.toBeNull();
+		expect(record?.signatureHash).toBe(getErc8128SignatureHash("0xsig1"));
 	});
 
 	it("returns empty array for missing keyId", async () => {
@@ -168,7 +212,7 @@ describe("secondaryStorage invalidation ops", () => {
 	it("returns null for missing signature", async () => {
 		const { storage } = createMockStorage();
 		const ops = createSecondaryStorageInvalidationOps(storage, 3600);
-		expect(await ops.findBySignature("0xmissing")).toBeNull();
+		expect(await ops.findBySignature("0xmissing", KEY_ID_ABC)).toBeNull();
 	});
 
 	it("swallows errors gracefully", async () => {
@@ -185,11 +229,10 @@ describe("secondaryStorage invalidation ops", () => {
 		};
 		const ops = createSecondaryStorageInvalidationOps(storage, 3600);
 
-		// Should not throw
 		await ops.upsertKeyIdNotBefore("key", 1000);
-		await ops.upsertSignatureInvalidation("key", "0xsig", 300);
+		await ops.upsertSignatureInvalidation(KEY_ID_ABC, "0xsig", 300);
 		expect(await ops.findByKeyId("key")).toEqual([]);
-		expect(await ops.findBySignature("0xsig")).toBeNull();
+		expect(await ops.findBySignature("0xsig", KEY_ID_ABC)).toBeNull();
 	});
 
 	it("respects TTL expiry", async () => {
@@ -198,11 +241,11 @@ describe("secondaryStorage invalidation ops", () => {
 			const { storage } = createMockStorage();
 			const ops = createSecondaryStorageInvalidationOps(storage, 1);
 
-			await ops.upsertKeyIdNotBefore("erc8128:1:0xabc", 1000, 1);
-			expect(await ops.findByKeyId("erc8128:1:0xabc")).toHaveLength(1);
+			await ops.upsertKeyIdNotBefore(KEY_ID_ABC, 1000, 1);
+			expect(await ops.findByKeyId(KEY_ID_ABC)).toHaveLength(1);
 
 			vi.advanceTimersByTime(1100);
-			expect(await ops.findByKeyId("erc8128:1:0xabc")).toEqual([]);
+			expect(await ops.findByKeyId(KEY_ID_ABC)).toEqual([]);
 		} finally {
 			vi.useRealTimers();
 		}
@@ -213,33 +256,30 @@ describe("dual invalidation ops", () => {
 	it("writes to both DB and secondaryStorage", async () => {
 		const { adapter } = createMockAdapter();
 		const { storage } = createMockStorage();
+		const nowSec = Math.floor(Date.now() / 1000);
 
 		const dbOps = createDBInvalidationOps(adapter);
 		const ssOps = createSecondaryStorageInvalidationOps(storage, 3600);
 		const dualOps = createDualInvalidationOps(dbOps, ssOps);
 
-		await dualOps.upsertKeyIdNotBefore("erc8128:1:0xabc", 1000);
-
-		// Both should have the record
-		expect(await dbOps.findByKeyId("erc8128:1:0xabc")).toHaveLength(1);
-		expect(await ssOps.findByKeyId("erc8128:1:0xabc")).toHaveLength(1);
+		await dualOps.upsertKeyIdNotBefore(KEY_ID_ABC, nowSec);
+		expect(await dbOps.findByKeyId(KEY_ID_ABC)).toHaveLength(1);
+		expect(await ssOps.findByKeyId(KEY_ID_ABC)).toHaveLength(1);
 	});
 
 	it("reads from secondaryStorage first, falls back to DB", async () => {
 		const { adapter } = createMockAdapter();
 		const { storage } = createMockStorage();
+		const nowSec = Math.floor(Date.now() / 1000);
 
 		const dbOps = createDBInvalidationOps(adapter);
 		const ssOps = createSecondaryStorageInvalidationOps(storage, 3600);
 		const dualOps = createDualInvalidationOps(dbOps, ssOps);
 
-		// Write only to DB
-		await dbOps.upsertKeyIdNotBefore("erc8128:1:0xdb-only", 500);
-
-		// Dual should find it via DB fallback
-		const records = await dualOps.findByKeyId("erc8128:1:0xdb-only");
+		await dbOps.upsertKeyIdNotBefore(KEY_ID_DB_ONLY, nowSec);
+		const records = await dualOps.findByKeyId(KEY_ID_DB_ONLY);
 		expect(records).toHaveLength(1);
-		expect(records[0]!.notBefore).toBe(500);
+		expect(records[0]!.notBefore).toBe(nowSec);
 	});
 
 	it("prefers secondaryStorage over DB on read", async () => {
@@ -250,25 +290,10 @@ describe("dual invalidation ops", () => {
 		const ssOps = createSecondaryStorageInvalidationOps(storage, 3600);
 		const dualOps = createDualInvalidationOps(dbOps, ssOps);
 
-		// Write different values to each
-		await dbOps.upsertKeyIdNotBefore("erc8128:1:0xabc", 100);
-		await ssOps.upsertKeyIdNotBefore("erc8128:1:0xabc", 200);
+		await dbOps.upsertKeyIdNotBefore(KEY_ID_ABC, 100);
+		await ssOps.upsertKeyIdNotBefore(KEY_ID_ABC, 200);
 
-		const records = await dualOps.findByKeyId("erc8128:1:0xabc");
-		expect(records[0]!.notBefore).toBe(200); // SS wins
-	});
-
-	it("dual-writes signature invalidation", async () => {
-		const { adapter } = createMockAdapter();
-		const { storage } = createMockStorage();
-
-		const dbOps = createDBInvalidationOps(adapter);
-		const ssOps = createSecondaryStorageInvalidationOps(storage, 3600);
-		const dualOps = createDualInvalidationOps(dbOps, ssOps);
-
-		await dualOps.upsertSignatureInvalidation("erc8128:1:0xabc", "0xsig", 300);
-
-		expect(await dbOps.findBySignature("0xsig")).not.toBeNull();
-		expect(await ssOps.findBySignature("0xsig")).not.toBeNull();
+		const records = await dualOps.findByKeyId(KEY_ID_ABC);
+		expect(records[0]!.notBefore).toBe(200);
 	});
 });

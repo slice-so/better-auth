@@ -1,18 +1,20 @@
 import type { SecondaryStorage } from "@better-auth/core/db";
+import type { Where } from "@better-auth/core/db/adapter";
 import type { NonceStore } from "@slicekit/erc8128";
 
-interface VerificationAdapter {
-	findVerificationValue(identifier: string): Promise<{
-		id: string;
-		identifier: string;
-		value: string;
-		expiresAt: Date;
-	} | null>;
-	createVerificationValue(data: {
-		identifier: string;
-		value: string;
-		expiresAt: Date;
-	}): Promise<unknown>;
+interface NonceAdapter {
+	findOne(args: {
+		model: string;
+		where: Where[];
+	}): Promise<Record<string, unknown> | null>;
+	create(args: {
+		model: string;
+		data: Record<string, unknown>;
+	}): Promise<Record<string, unknown>>;
+	deleteMany(args: {
+		model: string;
+		where: Where[];
+	}): Promise<number>;
 }
 
 const NONCE_KEY_PREFIX = "erc8128:nonce:";
@@ -46,7 +48,7 @@ export function createSecondaryStorageNonceStore(
 }
 
 /**
- * Dual-write NonceStore: consumes from both DB and secondaryStorage.
+ * Dual-write NonceStore: consumes from both `erc8128Nonce` and secondaryStorage.
  * Both must succeed for the nonce to be considered consumed.
  * Reads from secondaryStorage first (fast path), falls back to DB.
  */
@@ -98,9 +100,7 @@ export function createMemoryNonceStore(): NonceStore {
 	};
 }
 
-export function createAdapterNonceStore(
-	adapter: VerificationAdapter,
-): NonceStore {
+export function createAdapterNonceStore(adapter: NonceAdapter): NonceStore {
 	const fallback = new Map<string, number>();
 
 	const consumeFromFallback = (
@@ -125,23 +125,46 @@ export function createAdapterNonceStore(
 
 	return {
 		async consume(key: string, ttlSeconds: number): Promise<boolean> {
-			const identifier = `erc8128:nonce:${key}`;
+			const nonceKey = key;
 
 			try {
-				const existing = await adapter.findVerificationValue(identifier);
-				if (existing) {
+				const existing = await adapter.findOne({
+					model: "erc8128Nonce",
+					where: [{ field: "nonceKey", operator: "eq", value: nonceKey }],
+				});
+				const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+				const existingExpiresAt = existing?.expiresAt
+					? new Date(existing.expiresAt as string | number | Date)
+					: null;
+				if (
+					existing &&
+					existingExpiresAt &&
+					existingExpiresAt.getTime() > Date.now()
+				) {
 					return false;
 				}
-
-				await adapter.createVerificationValue({
-					identifier,
-					value: "1",
-					expiresAt: new Date(Date.now() + ttlSeconds * 1000),
+				if (existing) {
+					await adapter.deleteMany({
+						model: "erc8128Nonce",
+						where: [
+							{ field: "id", operator: "eq", value: String(existing.id) },
+						],
+					});
+				}
+				await adapter.create({
+					model: "erc8128Nonce",
+					data: {
+						nonceKey,
+						expiresAt,
+					},
 				});
 
 				return true;
 			} catch {
-				return consumeFromFallback(identifier, ttlSeconds);
+				return consumeFromFallback(
+					`${NONCE_KEY_PREFIX}${nonceKey}`,
+					ttlSeconds,
+				);
 			}
 		},
 	};

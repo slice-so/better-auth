@@ -1,4 +1,5 @@
 import type { SecondaryStorage } from "@better-auth/core/db";
+import type { Where } from "@better-auth/core/db/adapter";
 
 export type CacheValue = {
 	verified: true;
@@ -19,29 +20,44 @@ const CACHE_KEY_PREFIX = "erc8128:cache:";
  *
  * This is separate from (and should not be confused with):
  * - **Nonce store** — replay protection for non-replayable signatures; stored in
- *   the `verification` table via `nonce-store.ts`. Security-critical.
+ *   the `erc8128Nonce` table via `nonce-store.ts`. Security-critical.
  * - **Signature invalidation** — stored in the `erc8128Invalidation` table.
  *   Security-critical (losing state would re-enable revoked signatures).
  */
 export interface VerificationCacheOps {
 	get(key: string): Promise<CacheValue | null>;
-	set(key: string, value: CacheValue, ttlSec: number): Promise<void>;
+	set(data: {
+		key: string;
+		value: CacheValue;
+		ttlSec: number;
+		address: string;
+		chainId: number;
+		signatureHash: string;
+		expiresAt: Date;
+	}): Promise<void>;
 	delete(key: string): Promise<void>;
 	/** Sweep expired entries from the in-memory tier. No-op for TTL-based stores. */
 	sweep(): void;
 }
 
-/** Subset of `internalAdapter` used by the DB cache strategy. */
 export interface VerificationCacheAdapter {
-	findVerificationValue(
-		identifier: string,
-	): Promise<{ value: string; expiresAt: Date } | null>;
-	createVerificationValue(data: {
-		identifier: string;
-		value: string;
-		expiresAt: Date;
+	findOne(args: {
+		model: string;
+		where: Where[];
+	}): Promise<Record<string, unknown> | null>;
+	create(args: {
+		model: string;
+		data: Record<string, unknown>;
+	}): Promise<Record<string, unknown>>;
+	update(args: {
+		model: string;
+		where: Where[];
+		update: Record<string, unknown>;
 	}): Promise<unknown>;
-	deleteVerificationByIdentifier(identifier: string): Promise<void>;
+	deleteMany(args: {
+		model: string;
+		where: Where[];
+	}): Promise<number>;
 }
 
 /**
@@ -49,7 +65,7 @@ export interface VerificationCacheAdapter {
  *
  * Strategy resolution:
  *   secondaryStorage available → use it (fastest, shared, TTL-managed)
- *   otherwise                  → DB via verification table + in-memory L1
+ *   otherwise                  → DB via `erc8128VerificationCache` + in-memory L1
  *
  * All implementations are resilient: cache failures are swallowed so they never
  * block request processing.
@@ -75,7 +91,7 @@ export function createVerificationCacheOps(
 					return null;
 				}
 			},
-			async set(key, value, ttlSec) {
+			async set({ key, value, ttlSec }) {
 				try {
 					await secondaryStorage.set(
 						CACHE_KEY_PREFIX + key,
@@ -117,7 +133,7 @@ export function createVerificationCacheOps(
 		}
 	};
 
-	// --- Strategy: DB (verification table) with in-memory read-through cache ---
+	// --- Strategy: DB (`erc8128VerificationCache`) with in-memory read-through cache ---
 	// Reads check the in-memory Map first (fast L1), then fall back to a DB query.
 	// Writes persist to both in-memory and DB. DB entries expire via `expiresAt`.
 	// If DB operations fail, the in-memory Map acts as a graceful fallback.
@@ -126,34 +142,65 @@ export function createVerificationCacheOps(
 			const inMemory = fallbackMap.get(key);
 			if (inMemory) return inMemory;
 			try {
-				const record = await adapter.findVerificationValue(
-					CACHE_KEY_PREFIX + key,
-				);
+				const record = await adapter.findOne({
+					model: "erc8128VerificationCache",
+					where: [{ field: "cacheKey", operator: "eq", value: key }],
+				});
 				if (!record) return null;
-				const parsed = JSON.parse(record.value) as CacheValue;
+				const expiresAt = new Date(record.expiresAt as string | number | Date);
+				if (expiresAt.getTime() <= Date.now()) {
+					return null;
+				}
+				const parsed = {
+					verified: true,
+					expires: Math.floor(expiresAt.getTime() / 1000),
+				} satisfies CacheValue;
 				setInMemory(key, parsed);
 				return parsed;
 			} catch {
 				return null;
 			}
 		},
-		async set(key, value, ttlSec) {
+		async set(data) {
+			const { key, value, address, chainId, signatureHash, expiresAt } = data;
 			setInMemory(key, value);
 			try {
-				try {
-					await adapter.deleteVerificationByIdentifier(CACHE_KEY_PREFIX + key);
-				} catch {}
-				await adapter.createVerificationValue({
-					identifier: CACHE_KEY_PREFIX + key,
-					value: JSON.stringify(value),
-					expiresAt: new Date(Date.now() + ttlSec * 1000),
+				const existing = await adapter.findOne({
+					model: "erc8128VerificationCache",
+					where: [{ field: "cacheKey", operator: "eq", value: key }],
 				});
+				if (existing) {
+					await adapter.update({
+						model: "erc8128VerificationCache",
+						where: [{ field: "id", operator: "eq", value: String(existing.id) }],
+						update: {
+							address,
+							chainId,
+							signatureHash,
+							expiresAt,
+						},
+					});
+				} else {
+					await adapter.create({
+						model: "erc8128VerificationCache",
+						data: {
+							cacheKey: key,
+							address,
+							chainId,
+							signatureHash,
+							expiresAt,
+						},
+					});
+				}
 			} catch {}
 		},
 		async delete(key) {
 			fallbackMap.delete(key);
 			try {
-				await adapter.deleteVerificationByIdentifier(CACHE_KEY_PREFIX + key);
+				await adapter.deleteMany({
+					model: "erc8128VerificationCache",
+					where: [{ field: "cacheKey", operator: "eq", value: key }],
+				});
 			} catch {}
 		},
 		sweep: sweepInMemory,

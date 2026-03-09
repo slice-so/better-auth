@@ -199,6 +199,79 @@ if (result.principal) {
 If you want strict signature verification without policy-driven pass-through, use `auth.api.erc8128.verifyRequest(request)`.
 
 <Callout>
+  The plugin does not create or choose an RPC transport on its own. Whatever function you pass as `verifyMessage` is the function Better Auth will call for cryptographic verification, including any EOA or ERC-1271 RPC work.
+</Callout>
+
+### Hono
+
+If you already have Better Auth running in Hono, the ERC-8128 integration can stay small:
+
+1. Add the `erc8128` plugin to your Better Auth instance.
+2. Forward `/api/auth/*` to `auth.handler`.
+3. Call `protect()` inside any Hono route that should accept ERC-8128 signatures.
+
+```ts title="server.ts"
+import { betterAuth } from "better-auth";
+import { erc8128, getErc8128Api } from "better-auth/plugins/erc8128";
+import { Hono } from "hono";
+import { createPublicClient, http } from "viem";
+import { mainnet } from "viem/chains";
+
+const publicClient = createPublicClient({
+  chain: mainnet,
+  transport: http(process.env.RPC_URL),
+});
+
+const auth = betterAuth({
+  baseURL: "https://example.com",
+  secondaryStorage: {}, // (preferred) your secondary storage implementation here
+  database: {}, // (alternative / optional) your Better Auth database adapter
+  plugins: [
+    erc8128({
+      verifyMessage: publicClient.verifyMessage,
+      routePolicy: {
+        "/protected": [
+          {
+            methods: ["GET"],
+            replayable: false,
+          },
+        ],
+      },
+    }),
+  ],
+});
+
+const erc8128Api = getErc8128Api(auth);
+const app = new Hono();
+
+app.get("/.well-known/erc8128", async (c) => {
+  return c.json(await erc8128Api.getConfig(c.req.raw));
+});
+
+app.get("/protected", async (c) => {
+  const result = await erc8128Api.protect(c.req.raw);
+
+  if (!result.ok) {
+    return result.response;
+  }
+
+  return c.json({
+    success: true,
+    authenticated: result.authenticated,
+    address: result.verification?.address ?? null,
+  });
+});
+
+app.on(["GET", "POST"], "/api/auth/*", (c) => {
+  return auth.handler(c.req.raw);
+});
+
+export default app;
+```
+
+`protect()` verifies the ERC-8128 signature for routes covered by your `routePolicy`. `/.well-known/erc8128` exposes the discovery document, and `/api/auth/*` lets Better Auth handle the plugin's built-in endpoints.
+
+<Callout>
   For custom Better Auth or Better Call endpoints that both parse a request body and rely on ERC-8128 verification, set `cloneRequest: true`. Verification may need the original request bytes; without cloning, body parsing can consume the stream before downstream code or signature validation reads it.
 </Callout>
 
@@ -451,23 +524,43 @@ This follows the same pattern as Better Auth's [`session.storeSessionInDatabase`
 For production deployments with multiple server instances, configure `secondaryStorage` (e.g. Redis) so nonce tracking, invalidation, and verification caching are shared across all instances.
 </Callout>
 
+<Callout>
+When `secondaryStorage` is configured and `storeInDatabase: true`, ERC-8128 uses a best-effort distributed lease in secondary storage to run shared automatic cleanup for `erc8128Nonce`, `erc8128VerificationCache`, and `erc8128Invalidation` at most once per throttle window. Without `secondaryStorage`, automatic cleanup is off; use `cleanupExpiredErc8128Storage()` from your own cron/worker flow if you want database cleanup in that deployment shape.
+</Callout>
+
 ## Options
 
 ### Server
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `verifyMessage` | `VerifyMessageFn` | *required* | Signature verification function (use viem's `publicClient.verifyMessage` — handles both EOA and ERC-1271 smart contract signatures). |
+| `verifyMessage` | `VerifyMessageFn` | *required* | Signature verification function (use viem's `publicClient.verifyMessage` — handles both EOA and ERC-1271 smart contract signatures). The plugin does not override its transport or RPC source. |
 | `routePolicy` | `Record<string, RoutePolicy \| RoutePolicy[] \| false> & { default?: RoutePolicy }` | — | Per-route middleware policy map keyed by Better Auth paths relative to `basePath` — see [Route Policy](#route-policy). |
 | `sessionExpiresIn` | `number` | — | Session TTL in seconds (for `/erc8128/verify`). |
 | `maxValiditySec` | `number` | `300` | Maximum signature validity window (seconds). |
-| `clockSkewSec` | `number` | `30` | Allowed clock skew (seconds). |
+| `clockSkewSec` | `number` | `30` | Allowed clock skew (seconds) for future-dated timestamps and underlying verifier tolerance. The plugin still enforces `now < expires` as a hard expiry cutoff. |
 | `authPrecedence` | `"session-first" \| "signature-first" \| "reject-on-mismatch"` | `"session-first"` | How to handle requests that carry both a session cookie and an ERC-8128 signature. `session-first` skips verification; `signature-first` ignores the cookie; `reject-on-mismatch` verifies both and returns 401 if they map to different users. |
 | `storeInDatabase` | `boolean` | `false` | When `secondaryStorage` is configured, also persist nonces and invalidation to the database. See [Storage](#storage). |
+| `cleanupStrategy` | `"auto" \| "off"` | `"auto"` | Automatic cleanup strategy for expired ERC-8128 database rows. `"auto"` uses a best-effort distributed lease in `secondaryStorage` when available; otherwise it does nothing automatically. |
+| `cleanupThrottleSec` | `number` | `300` | Minimum time between automatic ERC-8128 database cleanup runs. |
 | `cacheSize` | `number` | `10000` | Max entries in the in-memory verification cache. Ignored when `secondaryStorage` is active. |
 | `emailDomainName` | `string` | From `baseURL` | Domain for auto-generated user emails. |
 | `anonymous` | `boolean` | `true` | If `false`, email is required on `/erc8128/verify`. Per-request auth can only authenticate already-linked wallets unless anonymous onboarding is enabled. |
 | `ensLookup` | `Function` | — | ENS resolver for new user name/avatar. |
+
+Manual cleanup helper:
+
+`expires` is enforced strictly by the plugin: once `now >= expires`, the signature is rejected. `clockSkewSec` does not extend validity past `expires`; it only affects underlying verifier tolerance around clock drift.
+
+```ts
+import { cleanupExpiredErc8128Storage } from "better-auth/plugins/erc8128";
+
+const ctx = await auth.$context;
+
+await cleanupExpiredErc8128Storage({
+  adapter: ctx.adapter,
+});
+```
 
 ### Client
 
@@ -506,14 +599,37 @@ For production deployments with multiple server instances, configure `secondaryS
 | `isPrimary` | `boolean` | Primary wallet flag. |
 | `createdAt` | `date` | Creation timestamp. |
 
-### `erc8128Invalidation`
+### `erc8128Nonce`
 
-Stores both per-keyId invalidation timestamps and per-signature invalidation records.
+Tracks consumed nonces for non-replayable signatures.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `keyId` | `string` | ERC-8128 key ID (`erc8128:<chainId>:<address>`). |
-| `signature` | `string` | Signature hex for per-signature invalidation. Empty for per-keyId `notBefore` rows. |
-| `notBefore` | `number` | Unix timestamp — signatures created before this are rejected. `0` for per-signature rows. |
-| `expiresAt` | `number` | Unix timestamp when this invalidation record can be cleaned up. `0` for per-keyId rows. |
-| `updatedAt` | `date` | Last update timestamp. |
+| `nonceKey` | `string` | Canonical nonce identifier (`erc8128:nonce:<keyId>:<nonce>`). Unique. |
+| `expiresAt` | `date` | When the consumed nonce stops blocking replays and becomes eligible for cleanup. Indexed. |
+
+### `erc8128VerificationCache`
+
+Caches successful replayable signature checks. The cache key is derived from the signer, signature, and canonical request-binding message.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `cacheKey` | `string` | Opaque cache lookup key for exact replayable verification matches. Unique. |
+| `address` | `string` | Signer address for query/filter use. Indexed. |
+| `chainId` | `number` | Chain ID extracted from the ERC-8128 key ID. Indexed. |
+| `signatureHash` | `string` | Hash of the submitted signature for direct signature lookup. Indexed. |
+| `expiresAt` | `date` | Verified signature expiry and cleanup cutoff. Indexed. |
+
+### `erc8128Invalidation`
+
+Stores both per-key invalidation timestamps and per-signature invalidation records.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `kind` | `string` | `"key"` for per-key invalidation, `"signature"` for per-signature invalidation. Indexed. |
+| `matchKey` | `string` | Canonical lookup key for the invalidation record. Unique. |
+| `address` | `string` | Signer address. Indexed. |
+| `chainId` | `number` | Chain ID from the ERC-8128 key ID. Indexed. |
+| `signatureHash` | `string` | Signature hash for per-signature invalidation rows. Nullable, indexed. |
+| `notBefore` | `number` | Unix timestamp for per-key invalidation. Signatures created before this are rejected. Nullable. |
+| `expiresAt` | `date` | Cleanup cutoff for both per-key and per-signature invalidation rows. Nullable, indexed. |

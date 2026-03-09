@@ -11,9 +11,6 @@ const val = (overrides?: Partial<CacheValue>): CacheValue => ({
 	...overrides,
 });
 
-// ---------------------------------------------------------------------------
-// Mock secondary storage
-// ---------------------------------------------------------------------------
 function createMockStorage() {
 	const store = new Map<string, { value: string; expiresAt: number }>();
 	return {
@@ -41,24 +38,74 @@ function createMockStorage() {
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Mock DB adapter
-// ---------------------------------------------------------------------------
 function createMockAdapter() {
-	const rows = new Map<string, { value: string; expiresAt: Date }>();
+	const rows = new Map<
+		string,
+		{
+			id: string;
+			cacheKey: string;
+			address: string;
+			chainId: number;
+			signatureHash: string;
+			expiresAt: Date;
+		}
+	>();
+	let nextId = 1;
 
 	const adapter: VerificationCacheAdapter = {
-		async findVerificationValue(identifier: string) {
-			return rows.get(identifier) ?? null;
+		async findOne(args) {
+			if (args.where.some((where) => where.field === "id")) {
+				const id = String(args.where.find((where) => where.field === "id")?.value);
+				return Array.from(rows.values()).find((row) => row.id === id) ?? null;
+			}
+			const cacheKey = String(
+				args.where.find((where) => where.field === "cacheKey")?.value,
+			);
+			return rows.get(cacheKey) ?? null;
 		},
-		async createVerificationValue(data) {
-			rows.set(data.identifier, {
-				value: data.value,
-				expiresAt: data.expiresAt,
-			});
+		async create(args) {
+			const row = {
+				id: String(nextId++),
+				cacheKey: String(args.data.cacheKey),
+				address: String(args.data.address),
+				chainId: Number(args.data.chainId),
+				signatureHash: String(args.data.signatureHash),
+				expiresAt: args.data.expiresAt as Date,
+			};
+			rows.set(row.cacheKey, row);
+			return row;
 		},
-		async deleteVerificationByIdentifier(identifier: string) {
-			rows.delete(identifier);
+		async update(args) {
+			const id = String(args.where.find((where) => where.field === "id")?.value);
+			const row = Array.from(rows.values()).find((entry) => entry.id === id);
+			if (row) {
+				Object.assign(row, args.update);
+			}
+			return row ?? null;
+		},
+		async deleteMany(args) {
+			if (args.where.some((where) => where.field === "cacheKey")) {
+				const cacheKey = String(
+					args.where.find((where) => where.field === "cacheKey")?.value,
+				);
+				return rows.delete(cacheKey) ? 1 : 0;
+			}
+			let deleted = 0;
+			for (const row of Array.from(rows.values())) {
+				if (
+					args.where.every((where) => {
+						if (where.field === "expiresAt" && where.operator === "lt") {
+							return row.expiresAt < (where.value as Date);
+						}
+						return String((row as Record<string, unknown>)[where.field] ?? "") ===
+							String(where.value ?? "");
+					})
+				) {
+					rows.delete(row.cacheKey);
+					deleted++;
+				}
+			}
+			return deleted;
 		},
 	};
 
@@ -77,7 +124,15 @@ describe("secondaryStorage cache ops", () => {
 		);
 
 		const v = val();
-		await ops.set("sig1", v, 300);
+		await ops.set({
+			key: "sig1",
+			value: v,
+			ttlSec: 300,
+			address: "0xabc",
+			chainId: 1,
+			signatureHash: "0xhash",
+			expiresAt: new Date(v.expires * 1000),
+		});
 		expect(await ops.get("sig1")).toEqual(v);
 	});
 
@@ -104,7 +159,15 @@ describe("secondaryStorage cache ops", () => {
 			100,
 		);
 
-		await ops.set("sig1", val(), 300);
+		await ops.set({
+			key: "sig1",
+			value: val(),
+			ttlSec: 300,
+			address: "0xabc",
+			chainId: 1,
+			signatureHash: "0xhash",
+			expiresAt: new Date(Date.now() + 300_000),
+		});
 		await ops.delete("sig1");
 		expect(await ops.get("sig1")).toBeNull();
 	});
@@ -119,7 +182,6 @@ describe("secondaryStorage cache ops", () => {
 			100,
 		);
 
-		// Should not throw
 		ops.sweep();
 	});
 
@@ -143,7 +205,15 @@ describe("secondaryStorage cache ops", () => {
 			100,
 		);
 
-		await ops.set("sig1", val(), 300);
+		await ops.set({
+			key: "sig1",
+			value: val(),
+			ttlSec: 300,
+			address: "0xabc",
+			chainId: 1,
+			signatureHash: "0xhash",
+			expiresAt: new Date(Date.now() + 300_000),
+		});
 		expect(await ops.get("sig1")).toBeNull();
 		await ops.delete("sig1");
 	});
@@ -162,14 +232,18 @@ describe("database cache ops", () => {
 		);
 
 		const v = val();
-		await ops.set("sig1", v, 300);
+		await ops.set({
+			key: "sig1",
+			value: v,
+			ttlSec: 300,
+			address: "0xabc",
+			chainId: 1,
+			signatureHash: "0xhash",
+			expiresAt: new Date(v.expires * 1000),
+		});
 
-		// In-memory
 		expect(fallbackMap.has("sig1")).toBe(true);
-		// DB
-		expect(rows.has("erc8128:cache:sig1")).toBe(true);
-
-		// Read hits memory (no DB call needed)
+		expect(rows.has("sig1")).toBe(true);
 		expect(await ops.get("sig1")).toEqual(v);
 	});
 
@@ -185,14 +259,19 @@ describe("database cache ops", () => {
 		);
 
 		const v = val();
-		await ops.set("sig1", v, 300);
+		await ops.set({
+			key: "sig1",
+			value: v,
+			ttlSec: 300,
+			address: "0xabc",
+			chainId: 1,
+			signatureHash: "0xhash",
+			expiresAt: new Date(v.expires * 1000),
+		});
 
-		// Clear in-memory to force DB fallback
 		fallbackMap.clear();
 		const result = await ops.get("sig1");
 		expect(result).toEqual(v);
-
-		// Should now be back in memory
 		expect(fallbackMap.has("sig1")).toBe(true);
 	});
 
@@ -219,11 +298,19 @@ describe("database cache ops", () => {
 			100,
 		);
 
-		await ops.set("sig1", val(), 300);
+		await ops.set({
+			key: "sig1",
+			value: val(),
+			ttlSec: 300,
+			address: "0xabc",
+			chainId: 1,
+			signatureHash: "0xhash",
+			expiresAt: new Date(Date.now() + 300_000),
+		});
 		await ops.delete("sig1");
 
 		expect(fallbackMap.has("sig1")).toBe(false);
-		expect(rows.has("erc8128:cache:sig1")).toBe(false);
+		expect(rows.has("sig1")).toBe(false);
 	});
 
 	it("enforces LRU eviction at max capacity", async () => {
@@ -236,11 +323,17 @@ describe("database cache ops", () => {
 			3,
 		);
 
-		await ops.set("sig1", val(), 300);
-		await ops.set("sig2", val(), 300);
-		await ops.set("sig3", val(), 300);
-		// This should evict sig1 (oldest)
-		await ops.set("sig4", val(), 300);
+		for (const key of ["sig1", "sig2", "sig3", "sig4"]) {
+			await ops.set({
+				key,
+				value: val(),
+				ttlSec: 300,
+				address: "0xabc",
+				chainId: 1,
+				signatureHash: `0x${key}`,
+				expiresAt: new Date(Date.now() + 300_000),
+			});
+		}
 
 		expect(fallbackMap.has("sig1")).toBe(false);
 		expect(fallbackMap.has("sig4")).toBe(true);
@@ -260,12 +353,26 @@ describe("database cache ops", () => {
 			);
 
 			const nowSec = Math.floor(Date.now() / 1000);
-			await ops.set("sig-expired", val({ expires: nowSec + 1 }), 1);
-			await ops.set("sig-valid", val({ expires: nowSec + 3600 }), 3600);
+			await ops.set({
+				key: "sig-expired",
+				value: val({ expires: nowSec + 1 }),
+				ttlSec: 1,
+				address: "0xabc",
+				chainId: 1,
+				signatureHash: "0xexpired",
+				expiresAt: new Date((nowSec + 1) * 1000),
+			});
+			await ops.set({
+				key: "sig-valid",
+				value: val({ expires: nowSec + 3600 }),
+				ttlSec: 3600,
+				address: "0xabc",
+				chainId: 1,
+				signatureHash: "0xvalid",
+				expiresAt: new Date((nowSec + 3600) * 1000),
+			});
 
-			// Advance past sweep interval (60s) and past the expiry
 			vi.advanceTimersByTime(61_000);
-
 			ops.sweep();
 
 			expect(fallbackMap.has("sig-expired")).toBe(false);
@@ -277,13 +384,16 @@ describe("database cache ops", () => {
 
 	it("swallows DB errors gracefully", async () => {
 		const brokenAdapter: VerificationCacheAdapter = {
-			async findVerificationValue() {
+			async findOne() {
 				throw new Error("DB down");
 			},
-			async createVerificationValue() {
+			async create() {
 				throw new Error("DB down");
 			},
-			async deleteVerificationByIdentifier() {
+			async update() {
+				throw new Error("DB down");
+			},
+			async deleteMany() {
 				throw new Error("DB down");
 			},
 		};
@@ -297,18 +407,20 @@ describe("database cache ops", () => {
 		);
 
 		const v = val();
-		// set should still work (in-memory)
-		await ops.set("sig1", v, 300);
+		await ops.set({
+			key: "sig1",
+			value: v,
+			ttlSec: 300,
+			address: "0xabc",
+			chainId: 1,
+			signatureHash: "0xhash",
+			expiresAt: new Date(v.expires * 1000),
+		});
 		expect(fallbackMap.has("sig1")).toBe(true);
-
-		// get from memory works
 		expect(await ops.get("sig1")).toEqual(v);
 
-		// get with no memory falls back to DB which fails gracefully
 		fallbackMap.clear();
 		expect(await ops.get("sig1")).toBeNull();
-
-		// delete doesn't throw
 		await ops.delete("sig1");
 	});
 });

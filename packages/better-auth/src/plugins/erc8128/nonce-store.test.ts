@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { Where } from "@better-auth/core/db/adapter";
 import {
 	createAdapterNonceStore,
 	createDualNonceStore,
@@ -6,27 +7,50 @@ import {
 	createSecondaryStorageNonceStore,
 } from "./nonce-store";
 
+type NonceAdapterMock = Parameters<typeof createAdapterNonceStore>[0];
+
+function createMockAdapterStore() {
+	const table = new Map<string, { id: string; nonceKey: string; expiresAt: Date }>();
+	let nextId = 1;
+
+	const adapter: NonceAdapterMock = {
+		async findOne(args: { model: string; where: Where[] }) {
+			return table.get(String(args.where[0]?.value)) ?? null;
+		},
+		async create(args: {
+			model: string;
+			data: Record<string, unknown>;
+		}) {
+			const row = {
+				id: String(nextId++),
+				nonceKey: String(args.data.nonceKey),
+				expiresAt: args.data.expiresAt as Date,
+			};
+			table.set(row.nonceKey, row);
+			return row;
+		},
+		async deleteMany(args: {
+			model: string;
+			where: Where[];
+		}) {
+			const id = String(args.where[0]?.value);
+			const row = Array.from(table.values()).find((entry) => entry.id === id);
+			if (row) {
+				table.delete(row.nonceKey);
+				return 1;
+			}
+			return 0;
+		},
+	};
+
+	return { table, adapter };
+}
+
 describe("erc8128 nonce store", () => {
 	it("consumes nonce only once", async () => {
-		const table = new Map<
-			string,
-			{ identifier: string; value: string; expiresAt: Date }
-		>();
-		const adapter = {
-			async findVerificationValue(identifier: string) {
-				const entry = table.get(identifier);
-				return entry ? { id: identifier, ...entry } : null;
-			},
-			async createVerificationValue(data: {
-				identifier: string;
-				value: string;
-				expiresAt: Date;
-			}) {
-				table.set(data.identifier, data);
-			},
-		};
-
+		const { adapter } = createMockAdapterStore();
 		const store = createAdapterNonceStore(adapter);
+
 		const first = await store.consume("nonce-key", 60);
 		const second = await store.consume("nonce-key", 60);
 
@@ -36,10 +60,13 @@ describe("erc8128 nonce store", () => {
 
 	it("falls back to in-memory map when adapter throws", async () => {
 		const adapter = {
-			async findVerificationValue() {
+			async findOne() {
 				throw new Error("DB down");
 			},
-			async createVerificationValue() {
+			async create() {
+				throw new Error("DB down");
+			},
+			async deleteMany() {
 				throw new Error("DB down");
 			},
 		};
@@ -55,30 +82,21 @@ describe("erc8128 nonce store", () => {
 	it("respects TTL expiry when adapter does not return expired values", async () => {
 		vi.useFakeTimers();
 		try {
-			const table = new Map<
-				string,
-				{ identifier: string; value: string; expiresAt: Date }
-			>();
-			const adapter = {
-				async findVerificationValue(identifier: string) {
-					const entry = table.get(identifier);
+			const { adapter, table } = createMockAdapterStore();
+			const store = createAdapterNonceStore({
+				...adapter,
+				async findOne(args: { model: string; where: Where[] }) {
+					const nonceKey = String(args.where[0]?.value);
+					const entry = table.get(nonceKey);
 					if (!entry) return null;
 					if (entry.expiresAt.getTime() <= Date.now()) {
-						table.delete(identifier);
+						table.delete(nonceKey);
 						return null;
 					}
-					return { id: identifier, ...entry };
+					return entry;
 				},
-				async createVerificationValue(data: {
-					identifier: string;
-					value: string;
-					expiresAt: Date;
-				}) {
-					table.set(data.identifier, data);
-				},
-			};
+			});
 
-			const store = createAdapterNonceStore(adapter);
 			expect(await store.consume("nonce-with-ttl", 1)).toBe(true);
 			expect(await store.consume("nonce-with-ttl", 1)).toBe(false);
 
@@ -209,27 +227,6 @@ describe("dual nonce store", () => {
 		};
 	}
 
-	function createMockAdapterStore() {
-		const table = new Map<
-			string,
-			{ identifier: string; value: string; expiresAt: Date }
-		>();
-		const adapter = {
-			async findVerificationValue(identifier: string) {
-				const entry = table.get(identifier);
-				return entry ? { id: identifier, ...entry } : null;
-			},
-			async createVerificationValue(data: {
-				identifier: string;
-				value: string;
-				expiresAt: Date;
-			}) {
-				table.set(data.identifier, data);
-			},
-		};
-		return { table, adapter };
-	}
-
 	it("consumes in both stores", async () => {
 		const { adapter } = createMockAdapterStore();
 		const { storage, store } = createMockStorage();
@@ -239,11 +236,7 @@ describe("dual nonce store", () => {
 		const dual = createDualNonceStore(dbStore, ssStore);
 
 		expect(await dual.consume("dual-nonce", 60)).toBe(true);
-
-		// Both stores should have the nonce
 		expect(store.size).toBeGreaterThan(0);
-
-		// Second consume should fail
 		expect(await dual.consume("dual-nonce", 60)).toBe(false);
 	});
 
@@ -257,10 +250,7 @@ describe("dual nonce store", () => {
 			ssStore,
 		);
 
-		// Pre-consume in SS only
 		await ssStore.consume("pre-consumed", 60);
-
-		// Dual should reject
 		expect(await dual.consume("pre-consumed", 60)).toBe(false);
 	});
 });

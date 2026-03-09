@@ -11,6 +11,11 @@ import { getTestInstance } from "../../test-utils/test-instance";
 import { erc8128, getErc8128Verification } from "./index";
 import { schema as erc8128Schema } from "./schema";
 import type { WalletAddress } from "./types";
+import {
+	getErc8128InvalidationMatchKey,
+	getErc8128SignatureHash,
+	getErc8128SignatureInvalidationMatchKey,
+} from "./utils";
 
 vi.mock("@slicekit/erc8128", async () => {
 	const actual =
@@ -64,6 +69,20 @@ function failResult(
 		ok: false,
 		reason,
 	};
+}
+
+async function flushAsyncWork(ticks = 5) {
+	for (let index = 0; index < ticks; index += 1) {
+		await Promise.resolve();
+	}
+}
+
+function createDeferred() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((resolver) => {
+		resolve = () => resolver();
+	});
+	return { promise, resolve };
 }
 
 function mockVerifier(
@@ -140,10 +159,46 @@ function cookieFromSetCookie(setCookie: string | null) {
 	return setCookie.split(";")[0] ?? "";
 }
 
+function createMockSecondaryStorage() {
+	const store = new Map<string, { value: string; expiresAt: number }>();
+	const get = vi.fn(async (key: string) => {
+		const entry = store.get(key);
+		if (!entry) return null;
+		if (entry.expiresAt <= Date.now()) {
+			store.delete(key);
+			return null;
+		}
+		return entry.value;
+	});
+	const set = vi.fn(async (key: string, value: string, ttl?: number) => {
+		store.set(key, {
+			value,
+			expiresAt: Date.now() + (ttl ?? 3600) * 1000,
+		});
+	});
+	const del = vi.fn(async (key: string) => {
+		store.delete(key);
+	});
+
+	return {
+		store,
+		get,
+		set,
+		delete: del,
+		storage: {
+			get,
+			set,
+			delete: del,
+		},
+	};
+}
+
 describe("erc8128 plugin", () => {
 	it("always registers full schema including invalidation table", () => {
 		const base = erc8128({ verifyMessage: async () => true });
 		expect(base.schema).toEqual(erc8128Schema);
+		expect(base.schema.erc8128Nonce).toBeDefined();
+		expect(base.schema.erc8128VerificationCache).toBeDefined();
 		expect(base.schema.erc8128Invalidation).toBeDefined();
 
 		const replayable = erc8128({
@@ -170,10 +225,6 @@ describe("erc8128 plugin", () => {
 			expect(data).toMatchObject({
 				verification_endpoint: "http://localhost:3000/api/auth/erc8128/verify",
 				max_validity_sec: 120,
-				capabilities: {
-					persistent_storage: true,
-					request_bound_middleware_only: false,
-				},
 			});
 			expect(data.invalidation_endpoint).toBeUndefined();
 		});
@@ -403,6 +454,38 @@ describe("erc8128 plugin", () => {
 			const { response, data } = await post(auth, "/erc8128/verify");
 			expect(response.status).toBe(200);
 			expect(data.success).toBe(true);
+		});
+
+		it("strictly rejects expired signatures on /erc8128/verify", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:10.000Z"));
+
+			try {
+				mockVerifier(async () =>
+					okResult({
+						created: Math.floor(Date.now() / 1000) - 20,
+						expires: Math.floor(Date.now() / 1000),
+						replayable: false,
+					}),
+				);
+				const { auth } = await getTestInstance({
+					plugins: [
+						erc8128({
+							verifyMessage: async () => true,
+							clockSkewSec: 30,
+						}),
+					],
+				});
+
+				const { response, data } = await post(auth, "/erc8128/verify");
+				expect(response.status).toBe(401);
+				expect(data).toMatchObject({
+					error: "erc8128_verification_failed",
+					reason: "expired",
+				});
+			} finally {
+				vi.useRealTimers();
+			}
 		});
 	});
 
@@ -820,6 +903,49 @@ describe("erc8128 plugin", () => {
 			});
 		});
 
+		it("strictly rejects middleware signatures once now reaches expires", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:10.000Z"));
+
+			try {
+				mockVerifier(async () =>
+					okResult({
+						created: Math.floor(Date.now() / 1000) - 20,
+						expires: Math.floor(Date.now() / 1000),
+						replayable: true,
+					}),
+				);
+				const { auth } = await getTestInstance({
+					plugins: [
+						erc8128({
+							verifyMessage: async () => true,
+							clockSkewSec: 30,
+							routePolicy: {
+								"/get-session": {
+									methods: ["GET"],
+									replayable: true,
+								},
+							},
+						}),
+					],
+				});
+
+				const { response, data } = await get(auth, "/get-session", {
+					headers: {
+						signature: "sig-expired-strict",
+						"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+					},
+				});
+				expect(response.status).toBe(401);
+				expect(data).toMatchObject({
+					error: "erc8128_verification_failed",
+					reason: "expired",
+				});
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
 		it("routePolicy exact match passes through on valid signature", async () => {
 			mockVerifier(async () => okResult());
 			const { auth } = await getTestInstance({
@@ -1042,6 +1168,67 @@ describe("erc8128 plugin", () => {
 			});
 		});
 
+		it("reject-on-mismatch resolves session in parallel with signature verification", async () => {
+			const sessionGate = createDeferred();
+			const verifyGate = createDeferred();
+			const events: string[] = [];
+
+			const { auth } = await getTestInstance({
+				plugins: [
+					erc8128({
+						verifyMessage: async () => true,
+						authPrecedence: "reject-on-mismatch",
+					}),
+				],
+			});
+
+			const verified = await post(auth, "/erc8128/verify");
+			const cookie = cookieFromSetCookie(
+				verified.response.headers.get("set-cookie"),
+			);
+
+			vi.mocked(createVerifierClient).mockImplementation(() => ({
+				verifyRequest: vi.fn(async () => {
+					events.push("verify-start");
+					await verifyGate.promise;
+					events.push("verify-end");
+					return okResult();
+				}),
+			}));
+
+			const protectPromise = auth.api.erc8128.protect(
+				new Request("http://localhost:3000/get-session", {
+					method: "GET",
+					headers: {
+						signature: "sig-parallel",
+						"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+						cookie,
+					},
+				}),
+				{
+					resolveSession: async () => {
+						events.push("session-start");
+						await sessionGate.promise;
+						events.push("session-end");
+						return null;
+					},
+				},
+			);
+
+			for (let index = 0; index < 20 && !events.includes("verify-start"); index += 1) {
+				await flushAsyncWork(5);
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			expect(events).toContain("session-start");
+			expect(events).toContain("verify-start");
+
+			verifyGate.resolve();
+			sessionGate.resolve();
+
+			const result = await protectPromise;
+			expect(result.ok).toBe(true);
+		});
+
 		it("unmatched route without routePolicy.default uses opportunistic fallthrough", async () => {
 			mockVerifier(async ({ request }) => {
 				if (request.url.endsWith("/verify")) {
@@ -1110,7 +1297,14 @@ describe("erc8128 plugin", () => {
 			const ctx = await auth.$context;
 			const invalidation = await ctx.adapter.findOne<{ notBefore: number }>({
 				model: "erc8128Invalidation",
-				where: [{ field: "keyId", operator: "eq", value: keyId }],
+				where: [
+					{ field: "kind", operator: "eq", value: "key" },
+					{
+						field: "matchKey",
+						operator: "eq",
+						value: getErc8128InvalidationMatchKey(keyId)!,
+					},
+				],
 			});
 			expect(invalidation?.notBefore).toBe(notBefore);
 		});
@@ -1193,12 +1387,14 @@ describe("erc8128 plugin", () => {
 			// DB record should be created with the signature field
 			const ctx = await auth.$context;
 			const dbRecords = await ctx.adapter.findMany<{
-				signature?: string;
+				signatureHash?: string;
 			}>({
 				model: "erc8128Invalidation",
 			});
 			expect(dbRecords).toHaveLength(1);
-			expect(dbRecords[0]?.signature).toBe(sigToInvalidate);
+			expect(dbRecords[0]?.signatureHash).toBe(
+				getErc8128SignatureHash(sigToInvalidate),
+			);
 		});
 
 		it("rejects providing both notBefore and signature", async () => {
@@ -1319,9 +1515,14 @@ describe("erc8128 plugin", () => {
 				return {
 					verifyRequest: vi.fn(async () => {
 						expect(storageGet).toHaveBeenCalledWith(
-							`erc8128:inv:keyid:${keyId.toLowerCase()}`,
+							`erc8128:inv:key:${getErc8128InvalidationMatchKey(keyId)!}`,
 						);
-						expect(storageGet).toHaveBeenCalledWith(`erc8128:inv:sig:${sig}`);
+						expect(storageGet).toHaveBeenCalledWith(
+							`erc8128:inv:sig:${getErc8128SignatureInvalidationMatchKey(
+								keyId,
+								getErc8128SignatureHash(sig),
+							)!}`,
+						);
 
 						const [notBefore, invalidated] = await Promise.all([
 							defaults.replayableNotBefore?.(keyId),
@@ -1369,8 +1570,11 @@ describe("erc8128 plugin", () => {
 				.map((call) => call[0])
 				.filter((key) => String(key).startsWith("erc8128:inv:"));
 			expect(invalidationGets).toEqual([
-				`erc8128:inv:keyid:${keyId.toLowerCase()}`,
-				`erc8128:inv:sig:${sig}`,
+				`erc8128:inv:key:${getErc8128InvalidationMatchKey(keyId)!}`,
+				`erc8128:inv:sig:${getErc8128SignatureInvalidationMatchKey(
+					keyId,
+					getErc8128SignatureHash(sig),
+				)!}`,
 			]);
 		});
 
@@ -1392,13 +1596,13 @@ describe("erc8128 plugin", () => {
 				return {
 					verifyRequest: vi.fn(async () => {
 						expect(storageGet).toHaveBeenCalledWith(
-							`erc8128:inv:keyid:${hintedKeyId.toLowerCase()}`,
+							`erc8128:inv:key:${getErc8128InvalidationMatchKey(hintedKeyId)!}`,
 						);
 
 						const notBefore = await defaults.replayableNotBefore?.(actualKeyId);
 						expect(notBefore).toBeNull();
 						expect(storageGet).toHaveBeenCalledWith(
-							`erc8128:inv:keyid:${actualKeyId.toLowerCase()}`,
+							`erc8128:inv:key:${getErc8128InvalidationMatchKey(actualKeyId)!}`,
 						);
 
 						return okResult({
@@ -1436,9 +1640,12 @@ describe("erc8128 plugin", () => {
 				.map((call) => call[0])
 				.filter((key) => String(key).startsWith("erc8128:inv:"));
 			expect(invalidationGets).toEqual([
-				`erc8128:inv:keyid:${hintedKeyId.toLowerCase()}`,
-				`erc8128:inv:sig:${sig}`,
-				`erc8128:inv:keyid:${actualKeyId.toLowerCase()}`,
+				`erc8128:inv:key:${getErc8128InvalidationMatchKey(hintedKeyId)!}`,
+				`erc8128:inv:sig:${getErc8128SignatureInvalidationMatchKey(
+					hintedKeyId,
+					getErc8128SignatureHash(sig),
+				)!}`,
+				`erc8128:inv:key:${getErc8128InvalidationMatchKey(actualKeyId)!}`,
 			]);
 		});
 
@@ -1611,7 +1818,445 @@ describe("erc8128 plugin", () => {
 		});
 	});
 
+	describe("automatic cleanup", () => {
+		it("cleans expired ERC-8128 DB rows in the background when secondaryStorage is available", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+			try {
+				mockVerifier(async () => okResult());
+				const secondaryStorage = createMockSecondaryStorage();
+				const { auth } = await getTestInstance({
+					secondaryStorage: secondaryStorage.storage,
+					plugins: [
+						erc8128({
+							verifyMessage: async () => true,
+							storeInDatabase: true,
+						}),
+					],
+				});
+				const ctx = await auth.$context;
+
+				await ctx.adapter.create({
+					model: "erc8128Nonce",
+					data: {
+						nonceKey: "erc8128:1:0xexpired:nonce-1",
+						expiresAt: new Date("2025-12-31T23:59:00.000Z"),
+					},
+				});
+				await ctx.adapter.create({
+					model: "erc8128VerificationCache",
+					data: {
+						cacheKey: "expired-cache",
+						address: defaultAddress.toLowerCase(),
+						chainId: defaultChainId,
+						signatureHash: "0xdead",
+						expiresAt: new Date("2025-12-31T23:59:00.000Z"),
+					},
+				});
+				await ctx.adapter.create({
+					model: "erc8128Invalidation",
+					data: {
+						kind: "key",
+						matchKey: formatKeyId(defaultChainId, defaultAddress).toLowerCase(),
+						address: defaultAddress.toLowerCase(),
+						chainId: defaultChainId,
+						notBefore: Math.floor(Date.now() / 1000) - 10,
+						expiresAt: new Date("2025-12-31T23:59:00.000Z"),
+					},
+				});
+
+				const { response } = await get(auth, "/get-session", {
+					headers: {
+						signature: "sig-cleanup",
+						"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+					},
+				});
+
+				expect(response.status).toBe(200);
+				await flushAsyncWork(10);
+
+				expect(
+					await ctx.adapter.findMany({ model: "erc8128Nonce" }),
+				).toHaveLength(0);
+				expect(
+					await ctx.adapter.findMany({ model: "erc8128VerificationCache" }),
+				).toHaveLength(0);
+				expect(
+					await ctx.adapter.findMany({ model: "erc8128Invalidation" }),
+				).toHaveLength(0);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("can disable automatic ERC-8128 DB cleanup", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+			try {
+				mockVerifier(async () => okResult());
+				const secondaryStorage = createMockSecondaryStorage();
+				const { auth } = await getTestInstance({
+					secondaryStorage: secondaryStorage.storage,
+					plugins: [
+						erc8128({
+							verifyMessage: async () => true,
+							storeInDatabase: true,
+							cleanupStrategy: "off",
+						}),
+					],
+				});
+				const ctx = await auth.$context;
+
+				await ctx.adapter.create({
+					model: "erc8128Nonce",
+					data: {
+						nonceKey: "erc8128:1:0xexpired:nonce-2",
+						expiresAt: new Date("2025-12-31T23:59:00.000Z"),
+					},
+				});
+				await ctx.adapter.create({
+					model: "erc8128VerificationCache",
+					data: {
+						cacheKey: "expired-cache-disabled",
+						address: defaultAddress.toLowerCase(),
+						chainId: defaultChainId,
+						signatureHash: "0xbeef",
+						expiresAt: new Date("2025-12-31T23:59:00.000Z"),
+					},
+				});
+				await ctx.adapter.create({
+					model: "erc8128Invalidation",
+					data: {
+						kind: "key",
+						matchKey: `${formatKeyId(defaultChainId, defaultAddress).toLowerCase()}:disabled`,
+						address: defaultAddress.toLowerCase(),
+						chainId: defaultChainId,
+						notBefore: Math.floor(Date.now() / 1000) - 10,
+						expiresAt: new Date("2025-12-31T23:59:00.000Z"),
+					},
+				});
+
+				const { response } = await get(auth, "/get-session", {
+					headers: {
+						signature: "sig-cleanup-disabled",
+						"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+					},
+				});
+
+				expect(response.status).toBe(200);
+				await flushAsyncWork(10);
+
+				expect(
+					await ctx.adapter.findMany({ model: "erc8128Nonce" }),
+				).toHaveLength(1);
+				expect(
+					await ctx.adapter.findMany({ model: "erc8128VerificationCache" }),
+				).toHaveLength(1);
+				expect(
+					await ctx.adapter.findMany({ model: "erc8128Invalidation" }),
+				).toHaveLength(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("does not auto-clean database rows when secondaryStorage is absent", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+			try {
+				mockVerifier(async () => okResult());
+				const { auth } = await getTestInstance({
+					plugins: [erc8128({ verifyMessage: async () => true })],
+				});
+				const ctx = await auth.$context;
+
+				await ctx.adapter.create({
+					model: "erc8128Nonce",
+					data: {
+						nonceKey: "erc8128:1:0xexpired:nonce-db-only",
+						expiresAt: new Date("2025-12-31T23:59:00.000Z"),
+					},
+				});
+
+				const { response } = await get(auth, "/get-session", {
+					headers: {
+						signature: "sig-cleanup-db-only",
+						"signature-input": 'sig=("@method" "@target-uri" "@authority")',
+					},
+				});
+
+				expect(response.status).toBe(200);
+				await flushAsyncWork(10);
+				expect(
+					await ctx.adapter.findMany({ model: "erc8128Nonce" }),
+				).toHaveLength(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
 	describe("replayable signature caching", () => {
+		it("stores DB cache entries using the verified signature expiry", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+			try {
+				const cacheSignature = "0xdeadbeef" as const;
+				const keyId = formatKeyId(defaultChainId, defaultAddress);
+				const expires = Math.floor(Date.now() / 1000) + 120;
+
+				vi.mocked(createVerifierClient).mockImplementation(
+					(args: { verifyMessage: VerifyMessageFn }) => ({
+						verifyRequest: vi.fn(async () => {
+							await args.verifyMessage({
+								address: defaultAddress,
+								message: { raw: "0x1234" },
+								signature: cacheSignature,
+							});
+							return okResult({ keyId, replayable: true, expires });
+						}),
+					}),
+				);
+
+				const { auth } = await getTestInstance(
+					{
+						plugins: [
+							erc8128({
+								verifyMessage: async () => true,
+								routePolicy: { default: { replayable: true } },
+								maxValiditySec: 300,
+							}),
+						],
+					},
+					{ disableTestUser: true },
+				);
+
+				const { response } = await get(auth, "/get-session", {
+					headers: {
+						signature: cacheSignature,
+						"signature-input": `sig=("@method" "@target-uri" "@authority");keyid="${keyId}"`,
+					},
+				});
+
+				expect(response.status).toBe(200);
+				await flushAsyncWork();
+
+				const ctx = await auth.$context;
+				const rows = await ctx.adapter.findMany<{
+					cacheKey: string;
+					signatureHash: string;
+					expiresAt: Date | string | number;
+				}>({
+					model: "erc8128VerificationCache",
+				});
+				expect(rows).toHaveLength(1);
+				expect(rows[0]?.signatureHash).toBe(
+					getErc8128SignatureHash(cacheSignature),
+				);
+				expect(new Date(rows[0]!.expiresAt).getTime()).toBe(
+					expires * 1000,
+				);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("does not store DB cache entries for non-replayable requests", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+			try {
+				const requestSignature = "0xbeadfeed" as const;
+				const keyId = formatKeyId(defaultChainId, defaultAddress);
+				const expires = Math.floor(Date.now() / 1000) + 45;
+
+				vi.mocked(createVerifierClient).mockImplementation(
+					(args: {
+						verifyMessage: VerifyMessageFn;
+						nonceStore: {
+							consume: (key: string, ttlSeconds: number) => Promise<boolean>;
+						};
+					}) => ({
+						verifyRequest: vi.fn(async () => {
+							await args.verifyMessage({
+								address: defaultAddress,
+								message: { raw: "0x5678" },
+								signature: requestSignature,
+							});
+							await args.nonceStore.consume(`${keyId}:nonce-1`, 45);
+							return okResult({ keyId, replayable: false, expires });
+						}),
+					}),
+				);
+
+				const { auth } = await getTestInstance(
+					{
+						plugins: [
+							erc8128({
+								verifyMessage: async () => true,
+								routePolicy: { default: { replayable: true } },
+							}),
+						],
+					},
+					{ disableTestUser: true },
+				);
+
+				const { response } = await get(auth, "/get-session", {
+					headers: {
+						signature: requestSignature,
+						"signature-input": `sig=("@method" "@target-uri" "@authority");keyid="${keyId}";nonce="nonce-1"`,
+					},
+				});
+
+				expect(response.status).toBe(200);
+				await flushAsyncWork();
+
+				const ctx = await auth.$context;
+				const cacheRows = await ctx.adapter.findMany<{ cacheKey: string }>({
+					model: "erc8128VerificationCache",
+				});
+				const nonceRows = await ctx.adapter.findMany<{ nonceKey: string }>({
+					model: "erc8128Nonce",
+				});
+
+				expect(cacheRows).toHaveLength(0);
+				expect(nonceRows).toHaveLength(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("stores secondaryStorage cache entries using the verified signature expiry", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+			try {
+				const storage = createMockSecondaryStorage();
+				const cacheSignature = "0xfeedcafe" as const;
+				const keyId = formatKeyId(defaultChainId, defaultAddress);
+				const expires = Math.floor(Date.now() / 1000) + 180;
+
+				vi.mocked(createVerifierClient).mockImplementation(
+					(args: { verifyMessage: VerifyMessageFn }) => ({
+						verifyRequest: vi.fn(async () => {
+							await args.verifyMessage({
+								address: defaultAddress,
+								message: { raw: "0x9abc" },
+								signature: cacheSignature,
+							});
+							return okResult({ keyId, replayable: true, expires });
+						}),
+					}),
+				);
+
+				const { auth } = await getTestInstance(
+					{
+						secondaryStorage: storage.storage,
+						plugins: [
+							erc8128({
+								verifyMessage: async () => true,
+								routePolicy: { default: { replayable: true } },
+								maxValiditySec: 300,
+							}),
+						],
+					},
+					{ disableTestUser: true },
+				);
+
+				const { response } = await get(auth, "/get-session", {
+					headers: {
+						signature: cacheSignature,
+						"signature-input": `sig=("@method" "@target-uri" "@authority");keyid="${keyId}"`,
+					},
+				});
+
+				expect(response.status).toBe(200);
+				await flushAsyncWork();
+
+				const cacheWrites = storage.set.mock.calls.filter(
+					([key]) => typeof key === "string" && key.startsWith("erc8128:cache:"),
+				);
+				expect(cacheWrites).toHaveLength(1);
+				expect(cacheWrites[0]?.[2]).toBe(180);
+				expect(JSON.parse(String(cacheWrites[0]?.[1]))).toEqual({
+					verified: true,
+					expires,
+				});
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("does not store secondaryStorage cache entries for non-replayable requests", async () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+			try {
+				const storage = createMockSecondaryStorage();
+				const requestSignature = "0xcafefeed" as const;
+				const keyId = formatKeyId(defaultChainId, defaultAddress);
+				const expires = Math.floor(Date.now() / 1000) + 45;
+
+				vi.mocked(createVerifierClient).mockImplementation(
+					(args: {
+						verifyMessage: VerifyMessageFn;
+						nonceStore: {
+							consume: (key: string, ttlSeconds: number) => Promise<boolean>;
+						};
+					}) => ({
+						verifyRequest: vi.fn(async () => {
+							await args.verifyMessage({
+								address: defaultAddress,
+								message: { raw: "0xdef0" },
+								signature: requestSignature,
+							});
+							await args.nonceStore.consume(`${keyId}:nonce-1`, 45);
+							return okResult({ keyId, replayable: false, expires });
+						}),
+					}),
+				);
+
+				const { auth } = await getTestInstance(
+					{
+						secondaryStorage: storage.storage,
+						plugins: [
+							erc8128({
+								verifyMessage: async () => true,
+								routePolicy: { default: { replayable: true } },
+							}),
+						],
+					},
+					{ disableTestUser: true },
+				);
+
+				const { response } = await get(auth, "/get-session", {
+					headers: {
+						signature: requestSignature,
+						"signature-input": `sig=("@method" "@target-uri" "@authority");keyid="${keyId}";nonce="nonce-1"`,
+					},
+				});
+
+				expect(response.status).toBe(200);
+				await flushAsyncWork();
+
+				const cacheWrites = storage.set.mock.calls.filter(
+					([key]) => typeof key === "string" && key.startsWith("erc8128:cache:"),
+				);
+				const nonceWrites = storage.set.mock.calls.filter(
+					([key]) => typeof key === "string" && key.startsWith("erc8128:nonce:"),
+				);
+
+				expect(cacheWrites).toHaveLength(0);
+				expect(nonceWrites).toHaveLength(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
 		it("runs full verification on every request while caching verifyMessage results", async () => {
 			const verifyMessageSpy = vi.fn<
 				(args: {

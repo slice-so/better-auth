@@ -33,31 +33,91 @@ export const walletAddressSchema = {
 	},
 } satisfies BetterAuthPluginDBSchema;
 
-export const invalidationSchema = {
-	erc8128Invalidation: {
+export const nonceSchema = {
+	erc8128Nonce: {
 		fields: {
-			keyId: {
+			nonceKey: {
+				type: "string",
+				required: true,
+				unique: true,
+			},
+			expiresAt: {
+				type: "date",
+				required: true,
+				index: true,
+			},
+		},
+	},
+} satisfies BetterAuthPluginDBSchema;
+
+export const verificationCacheSchema = {
+	erc8128VerificationCache: {
+		fields: {
+			cacheKey: {
+				type: "string",
+				required: true,
+				unique: true,
+			},
+			address: {
 				type: "string",
 				required: true,
 				index: true,
 			},
-			/** Per-signature invalidation: the signature hex. Empty for per-keyId notBefore rows. */
-			signature: {
+			chainId: {
+				type: "number",
+				required: true,
+				index: true,
+			},
+			signatureHash: {
 				type: "string",
-				defaultValue: "",
+				required: true,
+				index: true,
+			},
+			expiresAt: {
+				type: "date",
+				required: true,
+				index: true,
+			},
+		},
+	},
+} satisfies BetterAuthPluginDBSchema;
+
+export const invalidationSchema = {
+	erc8128Invalidation: {
+		fields: {
+			kind: {
+				type: "string",
+				required: true,
+				index: true,
+			},
+			matchKey: {
+				type: "string",
+				required: true,
+				unique: true,
+			},
+			address: {
+				type: "string",
+				required: true,
+				index: true,
+			},
+			chainId: {
+				type: "number",
+				required: true,
+				index: true,
+			},
+			signatureHash: {
+				type: "string",
+				required: false,
 				index: true,
 			},
 			notBefore: {
 				type: "number",
-				required: true,
+				required: false,
 			},
 			expiresAt: {
-				type: "number",
-				defaultValue: 0,
-			},
-			updatedAt: {
 				type: "date",
-				required: true,
+				required: false,
+				index: true,
 			},
 		},
 	},
@@ -65,6 +125,8 @@ export const invalidationSchema = {
 
 export const schema = {
 	...walletAddressSchema,
+	...nonceSchema,
+	...verificationCacheSchema,
 	...invalidationSchema,
 } satisfies BetterAuthPluginDBSchema;
 

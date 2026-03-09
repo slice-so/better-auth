@@ -27,6 +27,15 @@ import { mergeSchema } from "../../db/schema";
 import type { Auth, InferOptionSchema, User } from "../../types";
 import { HIDE_METADATA } from "../../utils/hide-metadata";
 import { getOrigin } from "../../utils/url";
+import {
+	createErc8128CleanupScheduler,
+	DEFAULT_ERC8128_CLEANUP_THROTTLE_SEC,
+} from "./cleanup";
+export {
+	cleanupExpiredErc8128Storage,
+	type CleanupExpiredErc8128StorageOptions,
+	type CleanupExpiredErc8128StorageResult,
+} from "./cleanup";
 import type { InvalidationOps } from "./invalidation-store";
 import {
 	createDBInvalidationOps,
@@ -49,7 +58,11 @@ import {
 import type { ERC8128Schema } from "./schema";
 import { schema } from "./schema";
 import type { ENSLookupArgs, ENSLookupResult, WalletAddress } from "./types";
-import { parseErc8128KeyId } from "./utils";
+import {
+	getErc8128CacheKey,
+	getErc8128SignatureHash,
+	parseErc8128KeyId,
+} from "./utils";
 import type { CacheValue, VerificationCacheOps } from "./verification-cache";
 import {
 	createVerificationCacheOps,
@@ -147,12 +160,17 @@ export interface Erc8128ServerApi {
 	) => Promise<Erc8128VerifyRequestResult>;
 }
 
-export type Erc8128ServerConfig = ReturnType<typeof formatDiscoveryDocument> & {
-	capabilities: {
-		persistent_storage: boolean;
-		request_bound_middleware_only: boolean;
-	};
-};
+type Erc8128ServerConfig = ReturnType<typeof formatDiscoveryDocument>;
+
+interface CachedVerifyMessageOps {
+	verifyMessage: VerifyMessageFn;
+	pending: {
+		cacheKey: string;
+		address: string;
+		signatureHash: string;
+	} | null;
+	persist(result: Erc8128VerifiedRequest): Promise<void>;
+}
 
 type BetterAuthPluginWithServerApi<API extends Record<string, unknown>> =
 	BetterAuthPlugin & {
@@ -162,7 +180,7 @@ type BetterAuthPluginWithServerApi<API extends Record<string, unknown>> =
 		$ServerAPI?: API;
 	};
 
-export interface ERC8128PluginOptions {
+interface ERC8128PluginOptions {
 	verifyMessage: VerifyMessageFn;
 	sessionExpiresIn?: number | undefined;
 	maxValiditySec?: number | undefined;
@@ -202,6 +220,22 @@ export interface ERC8128PluginOptions {
 	 * @default false
 	 */
 	storeInDatabase?: boolean | undefined;
+	/**
+	 * Automatic cleanup strategy for expired ERC-8128 DB rows.
+	 *
+	 * - `"auto"` — use a best-effort distributed lease in `secondaryStorage`
+	 *   when available, otherwise do nothing automatically.
+	 * - `"off"` — disable automatic cleanup entirely.
+	 *
+	 * @default "auto"
+	 */
+	cleanupStrategy?: "auto" | "off" | undefined;
+	/**
+	 * Minimum time between automatic ERC-8128 DB cleanup runs.
+	 *
+	 * @default 300
+	 */
+	cleanupThrottleSec?: number | undefined;
 	/**
 	 * How to handle requests that carry both a session cookie and an
 	 * ERC-8128 signature.
@@ -255,6 +289,22 @@ function jsonErrorResponse(
 			...(headers ?? {}),
 		},
 	});
+}
+
+function enforceStrictExpiry(
+	result: VerifyResult,
+): Extract<VerifyResult, { ok: false }> | null {
+	if (!result.ok) {
+		return null;
+	}
+	const nowSec = Math.floor(Date.now() / 1000);
+	if (nowSec < result.params.expires) {
+		return null;
+	}
+	return {
+		ok: false,
+		reason: "expired",
+	};
 }
 
 function cloneAuthContextForRequest<Options extends BetterAuthOptions>(
@@ -353,14 +403,13 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 	const fallbackCacheMap = new Map<string, CacheValue>();
 	const maxCacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
-	let cacheOps: VerificationCacheOps | null = null;
-	let invalidationOpsInstance: InvalidationOps | null = null;
-	let nonceStoreInstance: {
-		consume: (key: string, ttlSeconds: number) => Promise<boolean>;
-	} | null = null;
-	let storageMode: "secondary-storage" | "database" | "none" | null = null;
 	let warnedNoStorage = false;
 	let warnedReplayableNoStorage = false;
+	const cleanupThrottleSec =
+		options.cleanupThrottleSec ?? DEFAULT_ERC8128_CLEANUP_THROTTLE_SEC;
+	const keyInvalidationWindowSec =
+		(options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC) +
+		(options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC);
 
 	const warnNoStorage = () => {
 		if (warnedNoStorage) return;
@@ -382,94 +431,98 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 	};
 
 	const ensureStorageMode = async (ctx: GenericEndpointContext) => {
-		if (storageMode) return storageMode;
 		if (ctx.context.secondaryStorage) {
-			storageMode = "secondary-storage";
-			return storageMode;
+			return "secondary-storage" as const;
 		}
 		try {
-			await ctx.context.internalAdapter.findVerificationValue(
-				"__erc8128_probe__",
-			);
-			storageMode = "database";
-			return storageMode;
+			await ctx.context.adapter.findMany({
+				model: "erc8128Nonce",
+				limit: 1,
+			});
+			return "database" as const;
 		} catch {
-			storageMode = "none";
 			warnNoStorage();
-			return storageMode;
+			return "none" as const;
 		}
 	};
 
 	const getCache = (ctx: GenericEndpointContext): VerificationCacheOps => {
-		if (!cacheOps) {
-			const resolved: "secondary-storage" | "database" = ctx.context
-				.secondaryStorage
-				? "secondary-storage"
-				: "database";
-			cacheOps = createVerificationCacheOps(
-				resolved,
-				ctx.context.secondaryStorage,
-				ctx.context.internalAdapter,
-				fallbackCacheMap,
-				maxCacheSize,
+		const resolved: "secondary-storage" | "database" = ctx.context
+			.secondaryStorage
+			? "secondary-storage"
+			: "database";
+		return createVerificationCacheOps(
+			resolved,
+			ctx.context.secondaryStorage,
+			ctx.context.adapter,
+			fallbackCacheMap,
+			maxCacheSize,
+		);
+	};
+
+	const getInvalidationOps = (
+		ctx: GenericEndpointContext,
+		storageMode: "secondary-storage" | "database" | "none",
+	): InvalidationOps => {
+		if (storageMode === "none") {
+			return createMemoryInvalidationOps(
+				Math.max(
+					(options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC) * 2,
+					DEFAULT_INVALIDATION_TTL_SEC,
+				),
 			);
 		}
-		return cacheOps;
+		const dbOps = createDBInvalidationOps(ctx.context.adapter);
+		if (ctx.context.secondaryStorage) {
+			const maxTtl = options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC;
+			const invalidationTtl = Math.max(
+				maxTtl * 2,
+				DEFAULT_INVALIDATION_TTL_SEC,
+			);
+			const ssOps = createSecondaryStorageInvalidationOps(
+				ctx.context.secondaryStorage,
+				invalidationTtl,
+			);
+			return options.storeInDatabase ? createDualInvalidationOps(dbOps, ssOps) : ssOps;
+		}
+		return dbOps;
 	};
 
-	const getInvalidationOps = (ctx: GenericEndpointContext): InvalidationOps => {
-		if (!invalidationOpsInstance) {
-			if (storageMode === "none") {
-				invalidationOpsInstance = createMemoryInvalidationOps(
-					Math.max(
-						(options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC) * 2,
-						DEFAULT_INVALIDATION_TTL_SEC,
-					),
-				);
-				return invalidationOpsInstance;
-			}
-			const dbOps = createDBInvalidationOps(ctx.context.adapter);
-			if (ctx.context.secondaryStorage) {
-				const maxTtl = options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC;
-				const invalidationTtl = Math.max(
-					maxTtl * 2,
-					DEFAULT_INVALIDATION_TTL_SEC,
-				);
-				const ssOps = createSecondaryStorageInvalidationOps(
-					ctx.context.secondaryStorage,
-					invalidationTtl,
-				);
-				invalidationOpsInstance = options.storeInDatabase
-					? createDualInvalidationOps(dbOps, ssOps)
-					: ssOps;
-			} else {
-				invalidationOpsInstance = dbOps;
-			}
+	const getNonceStore = (
+		ctx: GenericEndpointContext,
+		storageMode: "secondary-storage" | "database" | "none",
+	) => {
+		if (storageMode === "none") {
+			return createMemoryNonceStore();
 		}
-		return invalidationOpsInstance;
+		if (ctx.context.secondaryStorage) {
+			const ssStore = createSecondaryStorageNonceStore(
+				ctx.context.secondaryStorage,
+			);
+			return options.storeInDatabase
+				? createDualNonceStore(
+						createAdapterNonceStore(ctx.context.adapter),
+						ssStore,
+					)
+				: ssStore;
+		}
+		return createAdapterNonceStore(ctx.context.adapter);
 	};
 
-	const getNonceStore = (ctx: GenericEndpointContext) => {
-		if (!nonceStoreInstance) {
-			if (storageMode === "none") {
-				nonceStoreInstance = createMemoryNonceStore();
-			} else if (ctx.context.secondaryStorage) {
-				const ssStore = createSecondaryStorageNonceStore(
-					ctx.context.secondaryStorage,
-				);
-				nonceStoreInstance = options.storeInDatabase
-					? createDualNonceStore(
-							createAdapterNonceStore(ctx.context.internalAdapter),
-							ssStore,
-						)
-					: ssStore;
-			} else {
-				nonceStoreInstance = createAdapterNonceStore(
-					ctx.context.internalAdapter,
-				);
-			}
+	const scheduleCleanup = async (ctx: GenericEndpointContext) => {
+		if (
+			(options.cleanupStrategy ?? "auto") !== "auto" ||
+			!options.storeInDatabase ||
+			!ctx.context.secondaryStorage
+		) {
+			return;
 		}
-		return nonceStoreInstance;
+		await createErc8128CleanupScheduler({
+			adapter: ctx.context.adapter,
+			secondaryStorage: ctx.context.secondaryStorage,
+			strategy: "auto",
+			throttleSec: cleanupThrottleSec,
+		}).schedule();
 	};
 
 	const createEphemeralSignatureSession = (
@@ -502,37 +555,63 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 	const createCachedVerifyMessage = (
 		ctx: GenericEndpointContext,
-	): VerifyMessageFn => {
+		storageMode: "secondary-storage" | "database" | "none",
+	): CachedVerifyMessageOps => {
 		if (!replayableEnabled || storageMode === "none") {
-			return options.verifyMessage;
+			return {
+				verifyMessage: options.verifyMessage,
+				pending: null,
+				async persist() {},
+			};
 		}
 
 		const cache = getCache(ctx);
-		const ttlSec = Math.max(
-			options.maxValiditySec ?? DEFAULT_MAX_VALIDITY_SEC,
-			1,
-		);
+		let pending: CachedVerifyMessageOps["pending"] = null;
 
-		return async (args) => {
-			cache.sweep();
-			const cacheKey = `${args.address.toLowerCase()}:${args.signature}:${args.message.raw}`;
-			const cached = await cache.get(cacheKey);
-			if (cached) {
-				return true;
-			}
+		return {
+			pending,
+			verifyMessage: async (args) => {
+				cache.sweep();
+				const cacheKey = getErc8128CacheKey({
+					address: args.address,
+					signature: args.signature,
+					messageRaw: args.message.raw,
+				});
+				const cached = await cache.get(cacheKey);
+				if (cached) {
+					return true;
+				}
 
-			const verified = await options.verifyMessage(args);
-			if (verified) {
-				await cache.set(
-					cacheKey,
-					{
+				const verified = await options.verifyMessage(args);
+				if (verified) {
+					pending = {
+						cacheKey,
+						address: args.address.toLowerCase(),
+						signatureHash: getErc8128SignatureHash(args.signature),
+					};
+				}
+				return verified;
+			},
+			async persist(result) {
+				if (!pending || !result.replayable) {
+					return;
+				}
+				const nowSec = Math.floor(Date.now() / 1000);
+				const ttlSec = Math.max(result.params.expires - nowSec, 1);
+				await cache.set({
+					key: pending.cacheKey,
+					value: {
 						verified: true,
-						expires: Math.floor(Date.now() / 1000) + ttlSec,
+						expires: result.params.expires,
 					},
 					ttlSec,
-				);
-			}
-			return verified;
+					address: pending.address,
+					chainId: result.chainId,
+					signatureHash: pending.signatureHash,
+					expiresAt: new Date(result.params.expires * 1000),
+				});
+				pending = null;
+			},
 		};
 	};
 
@@ -663,7 +742,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 	const getServerConfig = async (
 		ctx: GenericEndpointContext,
 	): Promise<Erc8128ServerConfig> => {
-		await ensureStorageMode(ctx);
+		const storageMode = await ensureStorageMode(ctx);
 		const baseURL = ctx.context.baseURL;
 
 		return {
@@ -679,10 +758,6 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					? normalizeRoutePolicyConfig(options.routePolicy, baseURL)
 					: undefined,
 			}),
-			capabilities: {
-				persistent_storage: storageMode !== "none",
-				request_bound_middleware_only: storageMode === "none",
-			},
 		};
 	};
 
@@ -691,7 +766,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 		request: Request,
 		policy?: RoutePolicy,
 	): Promise<Erc8128VerifyRequestResult> => {
-		await ensureStorageMode(ctx);
+		const storageMode = await ensureStorageMode(ctx);
+		await scheduleCleanup(ctx);
 		if (storageMode === "none" && policy?.replayable) {
 			warnReplayableNoStorage();
 			return {
@@ -737,7 +813,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 
 		const invalidationOps =
 			replayableEnabled && storageMode !== "none"
-				? getInvalidationOps(ctx)
+				? getInvalidationOps(ctx, storageMode)
 				: null;
 		const hintedKeyId =
 			extractKeyIdFromSignatureInput(signatureInput)?.toLowerCase() ?? null;
@@ -745,9 +821,10 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			invalidationOps && hintedKeyId
 				? invalidationOps.findByKeyId(hintedKeyId)
 				: null;
-		const prefetchedSignatureInvalidation = invalidationOps
-			? invalidationOps.findBySignature(signature)
-			: null;
+		const prefetchedSignatureInvalidation =
+			invalidationOps && hintedKeyId
+				? invalidationOps.findBySignature(signature, hintedKeyId)
+				: null;
 
 		const getKeyIdInvalidations = (keyid: string) => {
 			const normalizedKeyId = keyid.toLowerCase();
@@ -759,18 +836,24 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				: Promise.resolve([]);
 		};
 
-		const getSignatureInvalidation = (value: string) => {
-			if (prefetchedSignatureInvalidation && value === signature) {
+		const getSignatureInvalidation = (value: string, keyId: string) => {
+			const normalizedKeyId = keyId.toLowerCase();
+			if (
+				prefetchedSignatureInvalidation &&
+				value === signature &&
+				hintedKeyId === normalizedKeyId
+			) {
 				return prefetchedSignatureInvalidation;
 			}
 			return invalidationOps
-				? invalidationOps.findBySignature(value)
+				? invalidationOps.findBySignature(value, normalizedKeyId)
 				: Promise.resolve(null);
 		};
 
+		const cachedVerifyMessage = createCachedVerifyMessage(ctx, storageMode);
 		const verifier = createVerifierClient({
-			verifyMessage: createCachedVerifyMessage(ctx),
-			nonceStore: getNonceStore(ctx),
+			verifyMessage: cachedVerifyMessage.verifyMessage,
+			nonceStore: getNonceStore(ctx, storageMode),
 			defaults: {
 				maxValiditySec: options.maxValiditySec,
 				clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
@@ -779,11 +862,13 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					? {
 							replayableNotBefore: async (keyid: string) => {
 								const records = await getKeyIdInvalidations(keyid);
-								const keyRecord = records.find((record) => !record.signature);
+								const keyRecord = records.find(
+									(record) => !record.signatureHash,
+								);
 								return keyRecord?.notBefore ?? null;
 							},
 							replayableInvalidated: async ({ keyid, signature }) => {
-								const record = await getSignatureInvalidation(signature);
+								const record = await getSignatureInvalidation(signature, keyid);
 								return !!(
 									record &&
 									(!record.keyId || record.keyId === keyid.toLowerCase())
@@ -794,7 +879,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			},
 		});
 
-		const responseHeaders: Record<string, string> = {};
+			const responseHeaders: Record<string, string> = {};
 		const result = await verifier.verifyRequest({
 			request,
 			policy,
@@ -802,16 +887,18 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				responseHeaders[name] = value;
 			},
 		});
+		const strictExpiryFailure = enforceStrictExpiry(result);
 
-		if (!result.ok) {
+		if (!result.ok || strictExpiryFailure) {
+			const failure = strictExpiryFailure ?? result;
 			const reason =
-				result.reason === "replayable_invalidated"
+				failure.reason === "replayable_invalidated"
 					? "signature_invalidated"
-					: result.reason;
+					: failure.reason;
 			const detail =
-				result.reason === "replayable_invalidated"
+				failure.reason === "replayable_invalidated"
 					? "Signature has been explicitly invalidated"
-					: result.detail;
+					: failure.detail;
 			return {
 				ok: false,
 				response: jsonErrorResponse(
@@ -826,6 +913,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				responseHeaders: toHeaders(responseHeaders),
 			};
 		}
+
+		await cachedVerifyMessage.persist(result).catch(() => {});
 
 		return {
 			ok: true,
@@ -858,11 +947,17 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 		}
 
 		const precedence = options.authPrecedence ?? "session-first";
-		const currentSession =
+		const hasSessionCookie = request.headers
+			.get("cookie")
+			?.includes(ctx.context.authCookies.sessionToken.name);
+		const currentSessionPromise =
 			protectOptions?.resolveSession &&
-			request.headers
-				.get("cookie")
-				?.includes(ctx.context.authCookies.sessionToken.name)
+			hasSessionCookie &&
+			precedence === "reject-on-mismatch"
+				? protectOptions.resolveSession()
+				: null;
+		const currentSession =
+			protectOptions?.resolveSession && hasSessionCookie && !currentSessionPromise
 				? await protectOptions.resolveSession()
 				: null;
 
@@ -944,6 +1039,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			verificationResult.verification.address,
 			verificationResult.verification.chainId,
 		);
+		const resolvedCurrentSession = currentSessionPromise
+			? await currentSessionPromise
+			: currentSession;
 
 		if (!walletUser) {
 			return {
@@ -960,9 +1058,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 		}
 
 		if (
-			currentSession &&
+			resolvedCurrentSession &&
 			precedence === "reject-on-mismatch" &&
-			currentSession.user.id !== walletUser.id
+			resolvedCurrentSession.user.id !== walletUser.id
 		) {
 			return {
 				ok: false,
@@ -977,8 +1075,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 		}
 
 		const principal =
-			currentSession && precedence === "reject-on-mismatch"
-				? currentSession
+			resolvedCurrentSession && precedence === "reject-on-mismatch"
+				? resolvedCurrentSession
 				: createEphemeralSignatureSession(
 						walletUser,
 						verificationResult.verification,
@@ -1182,7 +1280,8 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					cloneRequest: true,
 				},
 				async (ctx) => {
-					await ensureStorageMode(ctx);
+					const storageMode = await ensureStorageMode(ctx);
+					await scheduleCleanup(ctx);
 					if (storageMode === "none") {
 						return new Response(null, { status: 404 });
 					}
@@ -1190,7 +1289,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 					// (replayable/class-bound flexibility is for the middleware only)
 					const verifier = createVerifierClient({
 						verifyMessage: options.verifyMessage,
-						nonceStore: getNonceStore(ctx),
+						nonceStore: getNonceStore(ctx, storageMode),
 						defaults: {
 							maxValiditySec: options.maxValiditySec,
 							clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
@@ -1208,12 +1307,14 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							responseHeaders[name] = value;
 						},
 					});
-					if (!result.ok) {
+					const strictExpiryFailure = enforceStrictExpiry(result);
+					if (!result.ok || strictExpiryFailure) {
+						const failure = strictExpiryFailure ?? result;
 						return new Response(
 							JSON.stringify({
 								error: "erc8128_verification_failed",
-								reason: result.reason,
-								detail: result.detail,
+								reason: failure.reason,
+								detail: failure.detail,
 							}),
 							{
 								status: 401,
@@ -1292,13 +1393,14 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								cloneRequest: true,
 							},
 							async (ctx) => {
-								await ensureStorageMode(ctx);
+								const storageMode = await ensureStorageMode(ctx);
+								await scheduleCleanup(ctx);
 								if (storageMode === "none") {
 									return new Response(null, { status: 404 });
 								}
 								const verifier = createVerifierClient({
 									verifyMessage: options.verifyMessage,
-									nonceStore: getNonceStore(ctx),
+									nonceStore: getNonceStore(ctx, storageMode),
 									defaults: {
 										maxValiditySec: options.maxValiditySec,
 										clockSkewSec:
@@ -1317,12 +1419,14 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 										responseHeaders[name] = value;
 									},
 								});
-								if (!result.ok) {
+								const strictExpiryFailure = enforceStrictExpiry(result);
+								if (!result.ok || strictExpiryFailure) {
+									const failure = strictExpiryFailure ?? result;
 									return new Response(
 										JSON.stringify({
 											error: "erc8128_verification_failed",
-											reason: result.reason,
-											detail: result.detail,
+											reason: failure.reason,
+											detail: failure.detail,
 										}),
 										{
 											status: 401,
@@ -1334,7 +1438,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 									);
 								}
 
-								const invOps = getInvalidationOps(ctx);
+								const invOps = getInvalidationOps(ctx, storageMode);
 								const maxValidity = options.maxValiditySec;
 
 								// Per-signature invalidation
@@ -1356,10 +1460,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								const notBefore =
 									ctx.body?.notBefore ?? Math.floor(Date.now() / 1000) + 1;
 
-								await invOps.upsertKeyIdNotBefore(
-									result.params.keyid,
-									notBefore,
-								);
+									await invOps.upsertKeyIdNotBefore(
+										result.params.keyid,
+										notBefore,
+										keyInvalidationWindowSec,
+									);
 
 								return ctx.json({
 									success: true,
