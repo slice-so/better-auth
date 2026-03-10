@@ -291,11 +291,11 @@ function jsonErrorResponse(
 	});
 }
 
-function enforceStrictExpiry(
-	result: VerifyResult,
-): Extract<VerifyResult, { ok: false }> | null {
+type VerifyFailure = Extract<VerifyResult, { ok: false }>;
+
+function getVerifyFailure(result: VerifyResult): VerifyFailure | null {
 	if (!result.ok) {
-		return null;
+		return result;
 	}
 	const nowSec = Math.floor(Date.now() / 1000);
 	if (nowSec < result.params.expires) {
@@ -498,15 +498,16 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 		if (ctx.context.secondaryStorage) {
 			const ssStore = createSecondaryStorageNonceStore(
 				ctx.context.secondaryStorage,
+				ctx.context.logger,
 			);
 			return options.storeInDatabase
 				? createDualNonceStore(
-						createAdapterNonceStore(ctx.context.adapter),
+						createAdapterNonceStore(ctx.context.adapter, ctx.context.logger),
 						ssStore,
 					)
 				: ssStore;
 		}
-		return createAdapterNonceStore(ctx.context.adapter);
+		return createAdapterNonceStore(ctx.context.adapter, ctx.context.logger);
 	};
 
 	const scheduleCleanup = async (ctx: GenericEndpointContext) => {
@@ -887,10 +888,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				responseHeaders[name] = value;
 			},
 		});
-		const strictExpiryFailure = enforceStrictExpiry(result);
+		const failure = getVerifyFailure(result);
 
-		if (!result.ok || strictExpiryFailure) {
-			const failure = strictExpiryFailure ?? result;
+		if (failure) {
 			const reason =
 				failure.reason === "replayable_invalidated"
 					? "signature_invalidated"
@@ -912,6 +912,12 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				),
 				responseHeaders: toHeaders(responseHeaders),
 			};
+		}
+
+		if (!result.ok) {
+			// Unreachable: getVerifyFailure returns non-null for !ok results.
+			// This branch exists solely for TypeScript narrowing.
+			throw new Error("[better-auth][erc8128] Unexpected verification state");
 		}
 
 		await cachedVerifyMessage.persist(result).catch(() => {});
@@ -1307,14 +1313,13 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 							responseHeaders[name] = value;
 						},
 					});
-					const strictExpiryFailure = enforceStrictExpiry(result);
-					if (!result.ok || strictExpiryFailure) {
-						const failure = strictExpiryFailure ?? result;
+					const verifyFailure = getVerifyFailure(result);
+					if (verifyFailure) {
 						return new Response(
 							JSON.stringify({
 								error: "erc8128_verification_failed",
-								reason: failure.reason,
-								detail: failure.detail,
+								reason: verifyFailure.reason,
+								detail: verifyFailure.detail,
 							}),
 							{
 								status: 401,
@@ -1324,6 +1329,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								},
 							},
 						);
+					}
+					if (!result.ok) {
+						throw new Error("[better-auth][erc8128] Unexpected verification state");
 					}
 
 					const key = parseErc8128KeyId(result.params.keyid);
@@ -1419,14 +1427,13 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 										responseHeaders[name] = value;
 									},
 								});
-								const strictExpiryFailure = enforceStrictExpiry(result);
-								if (!result.ok || strictExpiryFailure) {
-									const failure = strictExpiryFailure ?? result;
+								const verifyFailure = getVerifyFailure(result);
+								if (verifyFailure) {
 									return new Response(
 										JSON.stringify({
 											error: "erc8128_verification_failed",
-											reason: failure.reason,
-											detail: failure.detail,
+											reason: verifyFailure.reason,
+											detail: verifyFailure.detail,
 										}),
 										{
 											status: 401,
@@ -1436,6 +1443,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 											},
 										},
 									);
+								}
+								if (!result.ok) {
+									throw new Error("[better-auth][erc8128] Unexpected verification state");
 								}
 
 								const invOps = getInvalidationOps(ctx, storageMode);
