@@ -161,15 +161,32 @@ function cookieFromSetCookie(setCookie: string | null) {
 
 function createMockSecondaryStorage() {
 	const store = new Map<string, { value: string; expiresAt: number }>();
-	const get = vi.fn(async (key: string) => {
+	const getEntry = (key: string) => {
 		const entry = store.get(key);
 		if (!entry) return null;
 		if (entry.expiresAt <= Date.now()) {
 			store.delete(key);
 			return null;
 		}
+		return entry;
+	};
+	const get = vi.fn(async (key: string) => {
+		const entry = getEntry(key);
+		if (!entry) return null;
 		return entry.value;
 	});
+	const setIfNotExists = vi.fn(
+		async (key: string, value: string, ttl?: number): Promise<boolean> => {
+			if (getEntry(key)) {
+				return false;
+			}
+			store.set(key, {
+				value,
+				expiresAt: Date.now() + (ttl ?? 3600) * 1000,
+			});
+			return true;
+		},
+	);
 	const set = vi.fn(async (key: string, value: string, ttl?: number) => {
 		store.set(key, {
 			value,
@@ -184,10 +201,12 @@ function createMockSecondaryStorage() {
 		store,
 		get,
 		set,
+		setIfNotExists,
 		delete: del,
 		storage: {
 			get,
 			set,
+			setIfNotExists,
 			delete: del,
 		},
 	};
@@ -2204,11 +2223,17 @@ describe("erc8128 plugin", () => {
 				vi.mocked(createVerifierClient).mockImplementation(
 					(args: {
 						verifyMessage: VerifyMessageFn;
+						defaults?: {
+							replayableNotBefore?: unknown;
+							replayableInvalidated?: unknown;
+						};
 						nonceStore: {
 							consume: (key: string, ttlSeconds: number) => Promise<boolean>;
 						};
 					}) => ({
 						verifyRequest: vi.fn(async () => {
+							expect(args.defaults?.replayableNotBefore).toBeUndefined();
+							expect(args.defaults?.replayableInvalidated).toBeUndefined();
 							await args.verifyMessage({
 								address: defaultAddress,
 								message: { raw: "0xdef0" },
@@ -2243,13 +2268,20 @@ describe("erc8128 plugin", () => {
 				expect(response.status).toBe(200);
 				await flushAsyncWork();
 
+				const replayableReads = storage.get.mock.calls.filter(([key]) => {
+					return (
+						typeof key === "string" &&
+						(key.startsWith("erc8128:cache:") || key.startsWith("erc8128:inv:"))
+					);
+				});
 				const cacheWrites = storage.set.mock.calls.filter(
 					([key]) => typeof key === "string" && key.startsWith("erc8128:cache:"),
 				);
-				const nonceWrites = storage.set.mock.calls.filter(
+				const nonceWrites = storage.setIfNotExists.mock.calls.filter(
 					([key]) => typeof key === "string" && key.startsWith("erc8128:nonce:"),
 				);
 
+				expect(replayableReads).toHaveLength(0);
 				expect(cacheWrites).toHaveLength(0);
 				expect(nonceWrites).toHaveLength(1);
 			} finally {

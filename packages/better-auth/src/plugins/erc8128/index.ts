@@ -271,6 +271,10 @@ function extractKeyIdFromSignatureInput(signatureInput: string): string | null {
 	return match?.[1] ?? null;
 }
 
+function hasNonceInSignatureInput(signatureInput: string): boolean {
+	return /(?:^|;)\s*nonce="[^"]*"/i.test(signatureInput);
+}
+
 const WWW_AUTHENTICATE_HEADER =
 	'Signature realm="erc8128", headers="@method @target-uri @authority"';
 
@@ -560,8 +564,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 	const createCachedVerifyMessage = (
 		ctx: GenericEndpointContext,
 		storageMode: "secondary-storage" | "database" | "none",
+		replayableRequestEnabled: boolean,
 	): CachedVerifyMessageOps => {
-		if (!replayableEnabled || storageMode === "none") {
+		if (!replayableRequestEnabled || storageMode === "none") {
 			return {
 				verifyMessage: options.verifyMessage,
 				pending: null,
@@ -815,10 +820,14 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			};
 		}
 
+		const replayableRequestEnabled =
+			replayableEnabled &&
+			storageMode !== "none" &&
+			policy?.replayable !== false &&
+			!hasNonceInSignatureInput(signatureInput);
+
 		const invalidationOps =
-			replayableEnabled && storageMode !== "none"
-				? getInvalidationOps(ctx, storageMode)
-				: null;
+			replayableRequestEnabled ? getInvalidationOps(ctx, storageMode) : null;
 		const hintedKeyId =
 			extractKeyIdFromSignatureInput(signatureInput)?.toLowerCase() ?? null;
 		const prefetchedKeyIdInvalidations =
@@ -854,7 +863,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				: Promise.resolve(null);
 		};
 
-		const cachedVerifyMessage = createCachedVerifyMessage(ctx, storageMode);
+		const cachedVerifyMessage = createCachedVerifyMessage(
+			ctx,
+			storageMode,
+			replayableRequestEnabled,
+		);
 		const verifier = createVerifierClient({
 			verifyMessage: cachedVerifyMessage.verifyMessage,
 			nonceStore: getNonceStore(ctx, storageMode),
@@ -862,7 +875,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				maxValiditySec: options.maxValiditySec,
 				clockSkewSec: options.clockSkewSec ?? DEFAULT_CLOCK_SKEW_SEC,
 				maxSignatureVerifications: MAX_SIGNATURE_VERIFICATIONS,
-				...(replayableEnabled
+				...(replayableRequestEnabled
 					? {
 							replayableNotBefore: async (keyid: string) => {
 								const records = await getKeyIdInvalidations(keyid);
