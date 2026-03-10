@@ -55,8 +55,7 @@ export async function cleanupExpiredErc8128Storage(
 		nonceDeleted,
 		verificationCacheDeleted,
 		invalidationDeleted,
-		totalDeleted:
-			nonceDeleted + verificationCacheDeleted + invalidationDeleted,
+		totalDeleted: nonceDeleted + verificationCacheDeleted + invalidationDeleted,
 	};
 }
 

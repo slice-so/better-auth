@@ -31,11 +31,6 @@ import {
 	createErc8128CleanupScheduler,
 	DEFAULT_ERC8128_CLEANUP_THROTTLE_SEC,
 } from "./cleanup";
-export {
-	cleanupExpiredErc8128Storage,
-	type CleanupExpiredErc8128StorageOptions,
-	type CleanupExpiredErc8128StorageResult,
-} from "./cleanup";
 import type { InvalidationOps } from "./invalidation-store";
 import {
 	createDBInvalidationOps,
@@ -68,6 +63,12 @@ import {
 	createVerificationCacheOps,
 	DEFAULT_CACHE_SIZE,
 } from "./verification-cache";
+
+export {
+	type CleanupExpiredErc8128StorageOptions,
+	type CleanupExpiredErc8128StorageResult,
+	cleanupExpiredErc8128Storage,
+} from "./cleanup";
 
 /**
  * Fallback for invalidation TTL sizing when the user doesn't set `maxValiditySec`.
@@ -483,7 +484,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				ctx.context.secondaryStorage,
 				invalidationTtl,
 			);
-			return options.storeInDatabase ? createDualInvalidationOps(dbOps, ssOps) : ssOps;
+			return options.storeInDatabase
+				? createDualInvalidationOps(dbOps, ssOps)
+				: ssOps;
 		}
 		return dbOps;
 	};
@@ -880,7 +883,7 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 			},
 		});
 
-			const responseHeaders: Record<string, string> = {};
+		const responseHeaders: Record<string, string> = {};
 		const result = await verifier.verifyRequest({
 			request,
 			policy,
@@ -963,7 +966,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 				? protectOptions.resolveSession()
 				: null;
 		const currentSession =
-			protectOptions?.resolveSession && hasSessionCookie && !currentSessionPromise
+			protectOptions?.resolveSession &&
+			hasSessionCookie &&
+			!currentSessionPromise
 				? await protectOptions.resolveSession()
 				: null;
 
@@ -1331,7 +1336,9 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 						);
 					}
 					if (!result.ok) {
-						throw new Error("[better-auth][erc8128] Unexpected verification state");
+						throw new Error(
+							"[better-auth][erc8128] Unexpected verification state",
+						);
 					}
 
 					const key = parseErc8128KeyId(result.params.keyid);
@@ -1429,11 +1436,12 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								});
 								const verifyFailure = getVerifyFailure(result);
 								if (verifyFailure) {
+									const failure = verifyFailure;
 									return new Response(
 										JSON.stringify({
 											error: "erc8128_verification_failed",
-											reason: verifyFailure.reason,
-											detail: verifyFailure.detail,
+											reason: failure.reason,
+											detail: failure.detail,
 										}),
 										{
 											status: 401,
@@ -1444,8 +1452,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 										},
 									);
 								}
+
 								if (!result.ok) {
-									throw new Error("[better-auth][erc8128] Unexpected verification state");
+									throw new Error(
+										"[better-auth][erc8128] Unexpected verification state",
+									);
 								}
 
 								const invOps = getInvalidationOps(ctx, storageMode);
@@ -1470,11 +1481,11 @@ export const erc8128 = (options: ERC8128PluginOptions) => {
 								const notBefore =
 									ctx.body?.notBefore ?? Math.floor(Date.now() / 1000) + 1;
 
-									await invOps.upsertKeyIdNotBefore(
-										result.params.keyid,
-										notBefore,
-										keyInvalidationWindowSec,
-									);
+								await invOps.upsertKeyIdNotBefore(
+									result.params.keyid,
+									notBefore,
+									keyInvalidationWindowSec,
+								);
 
 								return ctx.json({
 									success: true,
